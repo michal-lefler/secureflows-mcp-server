@@ -1,0 +1,54 @@
+{
+  "name": "secureflows-mcp-server",
+  "version": "0.2.0",
+  "description": "MCP server that wraps secureFlows ai-safe APIs, plus token-free tools that help an agent scaffold a correct integration.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "secureflows-mcp": "./bin/secureflows-mcp.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "secureflows",
+    "secure-flows",
+    "mcp",
+    "model-context-protocol",
+    "ai-agent"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/michal-lefler/secureflows-mcp-server.git"
+  },
+  "homepage": "https://github.com/michal-lefler/secureflows-mcp-server#readme",
+  "bugs": {
+    "url": "https://github.com/michal-lefler/secureflows-mcp-server/issues"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/src/server.js",
+    "test": "node --import tsx --test test/**/*.test.ts",
+    "prepack": "npm run build && node scripts/bundle-openapi.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.1",
+    "express": "^5.1.0",
+    "yaml": "^2.8.1",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}

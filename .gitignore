@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.log
+
+# docs/openapi is committed here (this repo is a public mirror; see scripts/bundle-openapi.mjs)

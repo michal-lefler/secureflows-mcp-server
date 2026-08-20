@@ -1,0 +1,216 @@
+openapi: 3.1.0
+info:
+  title: secureFlows Documentation & Support Bot API
+  version: 1.1.0
+  description: |
+    Public documentation lookup and the human support bot. No authentication.
+
+    ### Documentation search (agents)
+    - Tagged **`ai-safe`**: call this API when SKILL.md or OpenAPI alone do not answer the question.
+    - **Do not** scrape the HTML page at `/docs/search/` — use the JSON endpoint.
+    - Workflow: search → open each hit's **`url`** for full text (often `/docs/read/?path=...`).
+    - On **`503`**: wait **5 seconds**, retry (up to **2 retries**, **3 attempts total**), then fall back
+      to SKILL + OpenAPI YAML URLs (Ollama cold start or index unavailable).
+
+    ### Support bot (humans)
+    - Tagged **`human-only`**: interactive chat UI at `/docs/assistant/`. Not intended for agent automation
+      (prefer `/docs/search` for structured hits).
+    - Streams an LLM answer over **SSE**, grounded in the same doc-search index when available.
+    - Conversation state is **client-side only** — resend the full `messages` array each turn.
+
+    ### Examples
+    ```bash
+    curl -sS "https://www.secure-flows.com/api/v1/docs/search?q=hosted+login+redirect_uri&limit=5"
+    ```
+
+    ```bash
+    curl -N -sS -X POST "https://www.secure-flows.com/api/v1/assistant/chat" \
+      -H "Content-Type: application/json" \
+      -d '{"messages":[{"role":"user","content":"How do I renew a session token?"}]}'
+    ```
+
+externalDocs:
+  description: Human search UI and Ask AI chat
+  url: ../../search/
+
+tags:
+  - name: ai-safe
+    description: Public read-only documentation lookup (no tokens)
+  - name: human-only
+    description: Human chat surface (SSE); prefer docs search for agents
+
+paths:
+  /api/v1/docs/search:
+    get:
+      summary: Semantic documentation search
+      description: |
+        Embeds the query with Ollama (`nomic-embed-text`) and returns the closest public doc chunks
+        from the environment's search index (pgvector).
+      operationId: getDocsSearch
+      tags: [ai-safe]
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+          description: Natural-language question or keywords
+          example: renew session token 410
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 20
+            default: 8
+          description: Maximum hits to return (server caps at 20)
+      responses:
+        "200":
+          description: Ranked documentation hits
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocSearchResponse"
+        "400":
+          description: Missing or blank query parameter `q`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Search disabled, Ollama unreachable, or index not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/assistant/chat:
+    post:
+      summary: Support bot chat (SSE)
+      description: |
+        Streams a natural-language answer grounded in public documentation (RAG via doc search).
+        If doc search is unavailable, the bot may still answer without grounding.
+
+        **Response:** `text/event-stream` with named events:
+        - `event: token` — `data: {"content":"<chunk>"}` (append to the assistant reply)
+        - `event: error` — `data: {"error":"<message>"}` then the stream ends
+
+        The server keeps no chat history. Clients must resend prior turns in `messages`.
+        History is trimmed server-side to the last **12** messages. The last message must be
+        `role: user`. Rate-limited more tightly than general API routes (LLM cost).
+      operationId: postAssistantChat
+      tags: [human-only]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssistantChatRequest"
+            example:
+              messages:
+                - role: user
+                  content: How do I renew a session token?
+      responses:
+        "200":
+          description: |
+            SSE stream. Success path emits `token` events then closes. Validation failures and
+            upstream unavailability also use this status with an `error` event (the emitter is
+            already streaming).
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Server-Sent Events. Token frames are JSON objects `{"content":"..."}`.
+                  Error frames are JSON objects `{"error":"..."}`.
+              examples:
+                tokenFrame:
+                  summary: Token event
+                  value: |
+                    event: token
+                    data: {"content":"Renew "}
+                errorFrame:
+                  summary: Error event
+                  value: |
+                    event: error
+                    data: {"error":"Assistant is temporarily unavailable. Please try again shortly."}
+        "429":
+          description: LLM rate limit exceeded for this IP (before the stream starts)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    DocSearchResponse:
+      type: object
+      required: [query, embedModel, limit, hits]
+      properties:
+        query:
+          type: string
+        embedModel:
+          type: string
+          example: nomic-embed-text
+        limit:
+          type: integer
+        hits:
+          type: array
+          items:
+            $ref: "#/components/schemas/DocSearchHit"
+    DocSearchHit:
+      type: object
+      required: [sourcePath, sourceType, title, heading, snippet, url, score]
+      properties:
+        sourcePath:
+          type: string
+          description: Repository-relative path of the indexed source file
+          example: docs/integration/quickstart.md
+        sourceType:
+          type: string
+          example: markdown
+        title:
+          type: string
+        heading:
+          type: string
+          description: Nearest section heading when chunked from Markdown
+        snippet:
+          type: string
+          description: Short excerpt from the chunk
+        url:
+          type: string
+          format: uri-reference
+          description: Public URL to read the full document
+          example: /docs/read/?path=docs%2Fintegration%2Fquickstart.md
+        score:
+          type: number
+          format: double
+          description: Similarity score (higher is better)
+    AssistantChatRequest:
+      type: object
+      required: [messages]
+      properties:
+        messages:
+          type: array
+          minItems: 1
+          description: Full conversation so far; last entry must be a user message
+          items:
+            $ref: "#/components/schemas/AssistantChatMessage"
+    AssistantChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [user, assistant]
+        content:
+          type: string
+          minLength: 1
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string

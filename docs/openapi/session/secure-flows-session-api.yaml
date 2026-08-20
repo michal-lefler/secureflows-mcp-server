@@ -1,0 +1,710 @@
+openapi: 3.1.0
+info:
+  title: secureFlows Session API
+  version: 1.3.6
+  description: |
+    **Session-only** surface: create an encrypted server-side session with a **Firebase ID token**,
+    then read/write a JSON **payload** using a **`sessionToken`** JWT (`tokenType=SESSION`).
+
+    ### Error responses
+    Failures return JSON **`{"status": <code>, "error": "<message>"}`** (unless noted otherwise).
+    Billing plan limit failures use **HTTP 429** and include a stable machine-readable **`code`**:
+    **`BILLING_SESSION_LIMIT`** (concurrent active sessions) or **`BILLING_PAYLOAD_LIMIT`** (decrypted
+    payload UTF-8 byte size). Example:
+    `{"status":429,"code":"BILLING_SESSION_LIMIT","error":"workspace concurrent session limit reached (max 20)"}`.
+    After cancel when the paid period ends without Free downgrade, workspaces enter **`grace_lock`** and
+    end-user session create/read/write/renew return **HTTP 403** with **`code: BILLING_GRACE_LOCK`**.
+    Admin list/revoke and billing Free downgrade remain available. If grace ends without Free
+    downgrade, the platform wipes **all** active session payloads and lands the workspace on Free;
+    session create is allowed again under Free limits.
+
+    ### Firebase email (audit + integrated app UI)
+    On **`POST /sessions`**, **`POST /sessions/get-or-create`**, **`POST /sessions/renew/{sessionToken}`**,
+    and hosted **`GET /auth/callback`**, the server reads **`email`** from the verified Firebase ID token
+    (when present) and **best-effort** stores it on the workspace end-user row. This does not change auth
+    semantics.
+
+    - **Workspace audit / console:** emails on user and audit rows instead of Firebase UID only.
+    - **Integrated app UI:** call **`GET /sessions/identity`** with the session token to show the signed-in
+      user's email next to **Sign out**, and to get a stable `userId` for your own backend to correlate
+      external events against (returns `{ "userId": 42, "email": "…" }`, either field may be `null`). Do
+      **not** decode the session JWT on the client for identity.
+
+    ### Intended use
+    - Tagged **`ai-safe`**: automation / agents should use **only** these paths, not console or integration flows.
+    - Sessions are **scoped by workspace name** and Firebase UID at creation time.
+
+    ### Critical integration rules (avoid common bugs)
+    - Store `sessionToken` in **memory only** (never `localStorage` / durable browser storage).
+    - Never send or trust client-provided identity (`userId`, `workspaceId`, `tenantId`) in request bodies —
+      this is about identity your own code sends *to* secureFlows, unrelated to the server-issued `userId`
+      that `GET /sessions/identity` returns *to* you; treat the latter as an opaque, trustworthy value.
+    - **`410` means token expired, data intact**. Do not treat as data loss; obtain a fresh token via hosted login / renew.
+    - **Expired session JWT** returns **`401`** (not JSON `403` Access denied). Clients must clear the token and show login/CTA — not keep retrying Session API with error banners after long idle.
+    - `GET /api/v1/sessions` returns a **flat JSON object** (empty payload is `{}`) — **payload only**, not user identity.
+    - User **identity (id/email) for UI or backend correlation** comes from **`GET /api/v1/sessions/identity`**, not from the payload or JWT decode.
+
+    ### Token cheat sheet
+    | Operation | Header |
+    |-----------|--------|
+    | `POST /api/v1/sessions` | `Authorization: Bearer <firebase-id-token>` |
+    | `POST /api/v1/sessions/get-or-create` | `Authorization: Bearer <firebase-id-token>` |
+    | `POST /api/v1/sessions/renew/{sessionToken}` | `Authorization: Bearer <firebase-id-token>` (path: previous session JWT, may be expired; URL-encode) |
+    | `GET /api/v1/sessions/identity` | `Authorization: Bearer <sessionToken>` |
+    | `GET/POST/DELETE` on other `/api/v1/sessions/...` paths (except renew) | `Authorization: Bearer <sessionToken>` |
+
+    ### Example (curl)
+    ```bash
+    # 1) Create session
+    curl -sS -X POST "http://<host>/api/v1/sessions" \\
+      -H "Authorization: Bearer $FIREBASE_JWT" \\
+      -H "Content-Type: application/json" \\
+      -d '{"workspaceName":"demo-ws","payload":{"hello":"world"}}'
+
+    # 2) Use sessionToken from response — read payload
+    curl -sS "http://<host>/api/v1/sessions" \\
+      -H "Authorization: Bearer $SESSION_JWT"
+
+    # 3) Signed-in user's stable id + email (app header, or your backend's correlation key)
+    curl -sS "http://<host>/api/v1/sessions/identity" \\
+      -H "Authorization: Bearer $SESSION_JWT"
+    ```
+
+externalDocs:
+  description: API documentation hub
+  url: ../index.html
+
+tags:
+  - name: ai-safe
+    description: Session lifecycle and payload keys (automation-safe subset)
+
+paths:
+  /api/v1/sessions:
+    post:
+      summary: Create a new session
+      description: |
+        Verifies **Firebase** ID token, creates a session for **`workspaceName`**, stores serialized
+        **`payload`** (defaults to `{}` when omitted), and returns **`sessionToken`** (JWT; subject = internal session id).
+        Default server-side TTL is **1 hour** (implementation detail).
+
+        If the Firebase token includes **`email`**, the server best-effort persists it on the workspace
+        end-user row (for audit display). Prefer **`POST /sessions/get-or-create`** for hosted-login-style
+        flows that should reuse an active session.
+      tags: [ai-safe]
+      security:
+        - firebaseBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionRequest'
+            examples:
+              emptyPayload:
+                summary: No payload field (stored as {})
+                value:
+                  workspaceName: demo-workspace
+                  app_id: acme-web
+              minimal:
+                summary: Simple payload
+                value:
+                  workspaceName: demo-workspace
+                  app_id: acme-web
+                  payload:
+                    hello: world
+                    from: safehook demo
+      responses:
+        "200":
+          description: Session created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateSessionResponse'
+              examples:
+                ok:
+                  value:
+                    sessionToken: eyJhbGciOi...SESSION
+        "401":
+          description: Missing or invalid Firebase Authorization header.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              examples:
+                missing:
+                  value:
+                    status: 401
+                    error: Missing Authorization header
+                invalid:
+                  value:
+                    status: 401
+                    error: Invalid Firebase token
+        "404":
+          description: Workspace name unknown (if applicable)
+        "403":
+          $ref: '#/components/responses/BillingGraceLock'
+        "429":
+          $ref: '#/components/responses/BillingLimitExceeded'
+
+    get:
+      summary: Get the current session payload
+      description: |
+        Returns the decrypted session payload for the authenticated internal session token.
+
+        Response shape is a **flat JSON object**. Empty payload returns `{}`.
+      tags: [ai-safe]
+      security:
+        - sessionBearerAuth: []
+      responses:
+        "200":
+          description: Session payload returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionPayloadObject'
+              example:
+                hello: world
+                counter: 1
+        "401":
+          description: |
+            Missing, invalid, or **JWT-expired** session Bearer token.
+            (Expired JWT is HTTP 401 — not JSON 403 Access denied.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 401
+                error: Session token expired
+        "403":
+          $ref: '#/components/responses/BillingGraceLock'
+        "410":
+          description: |
+            Session token expired (HTTP 410 ≠ data loss).
+
+            The underlying session payload may still exist; obtain a fresh token (hosted login renewal / renew flow).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 410
+                error: Session expired
+
+  /api/v1/sessions/identity:
+    get:
+      summary: Get signed-in user's stable id and email (app UI, backend correlation)
+      description: |
+        Returns the workspace end-user's **`userId`** and **email** for the authenticated session
+        token. Does not return Firebase UID or session payload.
+
+        `userId` is a stable, opaque identifier for this person across sessions and logins — it is
+        **not** derived from Firebase. Use it as the correlation key when your own backend needs to
+        link an external event (e.g. a billing provider webhook you receive and verify yourself)
+        back to this user. Do not use the session token or session id for this — sessions expire and
+        rotate, `userId` does not.
+
+        Email is best-effort from hosted login (Firebase `email` claim persisted on the user row).
+        When unknown, `email` is `null`. Browser SDK: **`secureflows-js`** **`fetchSessionIdentity(token)`** (≥ 0.1.15 for `userId`).
+      tags: [ai-safe]
+      security:
+        - sessionBearerAuth: []
+      responses:
+        "200":
+          description: Session identity returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionIdentityView'
+              example:
+                userId: 42
+                email: user@example.com
+        "401":
+          description: Missing or invalid internal session token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        "410":
+          description: Session token expired.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /api/v1/sessions/get-or-create:
+    post:
+      summary: Reuse active session or create one
+      description: |
+        Verifies **Firebase** ID token. If an **active** session already exists for
+        **`(workspaceName, Firebase UID, app_id)`**, returns a new **`sessionToken`** JWT for the **most
+        recently created** matching row (touches activity; does not create a duplicate session). The request
+        **`payload` is ignored on reuse** — it is applied only when a new session row is created. Prefer a
+        dedicated `app_id` per integration surface, or revoke old sessions, if you need a fresh payload.
+
+        Otherwise behaves like **`POST /sessions`** (new row + default **1 hour** TTL).
+
+        If the Firebase token includes **`email`**, the server best-effort persists or backfills it on the
+        workspace end-user row (including when reusing an existing session). Intended for integrators that
+        mirror hosted login session reuse.
+      tags: [ai-safe]
+      security:
+        - firebaseBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionRequest'
+      responses:
+        "200":
+          description: Session token for an existing or newly created session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateSessionResponse'
+        "401":
+          description: Missing or invalid Firebase Authorization header.
+        "404":
+          description: Workspace name unknown (if applicable)
+        "403":
+          $ref: '#/components/responses/BillingGraceLock'
+        "429":
+          $ref: '#/components/responses/BillingLimitExceeded'
+
+  /api/v1/sessions/renew/{sessionToken}:
+    post:
+      summary: Renew session JWT (replace expired token)
+      description: |
+        Verifies **Firebase** ID token. Parses **`sessionToken`** path segment as an internal SESSION JWT **without
+        enforcing JWT expiry** (signature and `tokenType=SESSION` are still validated). Loads the
+        session by id from the token subject; the Firebase UID must match the session owner.
+        Increments **`tokenRevision`** on the server so **previous session JWTs** (same session id,
+        older revision) are no longer accepted for `GET/POST/DELETE /sessions/...`.
+        Returns a **new `sessionToken`** (with the new `tokenRevision` claim) and the current decrypted
+        **payload**; extends server-side session expiry by **1 hour**.
+
+        If the Firebase token includes **`email`**, the server best-effort backfills it on the session owner
+        when the user row has no email yet (audit display only).
+
+        Use the path form `POST /api/v1/sessions/renew/{sessionToken}` — **URL-encode** the JWT (e.g. `encodeURIComponent` in JS).
+      tags: [ai-optional]
+      security:
+        - firebaseBearerAuth: []
+      parameters:
+        - name: sessionToken
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Previous SESSION JWT (may be expired); URL-encoded in the path
+      responses:
+        "200":
+          description: New session token and payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionRenewResponse'
+        "400":
+          description: Empty session token path segment (if applicable).
+        "401":
+          description: Missing Authorization, invalid Firebase token, or invalid session token (signature / shape).
+        "403":
+          description: |
+            Firebase user does not own this session, or workspace is in `grace_lock`
+            (`code: BILLING_GRACE_LOCK`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              examples:
+                notOwner:
+                  value:
+                    status: 403
+                    error: Firebase user does not own this session
+                graceLock:
+                  value:
+                    status: 403
+                    code: BILLING_GRACE_LOCK
+                    error: Workspace is locked after paid period ended without Free downgrade; end-user session access is blocked until you Downgrade to Free (reduce usage first if over Free limits)
+        "404":
+          description: Session id not found.
+        "410":
+          description: Session revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 410
+                error: Session revoked
+
+  /api/v1/sessions/set/{key}:
+    post:
+      summary: Set a value inside the session payload
+      description: >
+        Sets a key in the encrypted session payload and returns the updated decrypted payload.
+        If the JSON body is `{ "value": <x> }`, the server unwraps it and stores `<x>` directly.
+      tags: [ai-safe]
+      security:
+        - sessionBearerAuth: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Payload key to set
+          example: hello
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetSessionValueRequest'
+            examples:
+              wrapped:
+                summary: Preferred wrapper format
+                value:
+                  value: new-value
+              raw:
+                summary: Raw value (server stores it as-is)
+                value: true
+      responses:
+        "200":
+          description: Updated session payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionPayloadObject'
+              example:
+                hello: world
+                newKey: new-value
+        "401":
+          description: Missing or invalid internal session token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 401
+                error: Missing Authorization header
+        "403":
+          $ref: '#/components/responses/BillingGraceLock'
+        "429":
+          $ref: '#/components/responses/BillingLimitExceeded'
+
+  /api/v1/sessions/get/{key}:
+    get:
+      summary: Get a single value from the session payload
+      description: |
+        Retrieves the decrypted payload value for `key`.
+
+        **Important:** `404` means the key was never written (normal first-use case). Do not treat as an error.
+      tags: [ai-safe]
+      security:
+        - sessionBearerAuth: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Payload key to read
+          example: hello
+      responses:
+        "200":
+          description: Key/value returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetSessionValueResponse'
+              example:
+                key: hello
+                value: world
+        "401":
+          description: Missing or invalid internal session token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 401
+                error: Missing Authorization header
+        "404":
+          description: Key not found (normal if never written yet).
+        "410":
+          description: |
+            Session token expired (HTTP 410 ≠ data loss).
+
+            The underlying session payload may still exist; obtain a fresh token (hosted login renewal / renew flow).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 410
+                error: Session expired
+
+  /api/v1/sessions/delete/{key}:
+    delete:
+      summary: Delete a key from the session payload
+      description: >
+        Removes `key` from the session payload and returns `true` if the key existed.
+      tags: [ai-safe]
+      security:
+        - sessionBearerAuth: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Payload key to delete
+          example: hello
+      responses:
+        "200":
+          description: Deletion result.
+          content:
+            application/json:
+              schema:
+                type: boolean
+              example: true
+        "401":
+          description: Missing or invalid internal session token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 401
+                error: Missing Authorization header
+        "410":
+          description: |
+            Session token expired (HTTP 410 ≠ data loss).
+
+            The underlying session payload may still exist; obtain a fresh token (hosted login renewal / renew flow).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 410
+                error: Session expired
+
+  /api/v1/sessions/revoke:
+    post:
+      summary: Revoke the current session (by session token)
+      description: >
+        Revokes the session referenced by the internal SESSION Bearer token. This endpoint is useful
+        for automation clients that only hold a session token and want to revoke it cleanly.
+      tags: [ai-safe]
+      security:
+        - sessionBearerAuth: []
+      responses:
+        "200":
+          description: Session revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked:
+                    type: boolean
+                    example: true
+                  sessionId:
+                    type: integer
+                    format: int64
+                    example: 123
+        "401":
+          description: Missing or invalid internal session token.
+        "404":
+          description: Session not found.
+        "410":
+          description: Session revoked or token superseded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 410
+                error: Session revoked
+
+components:
+  securitySchemes:
+    firebaseBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Firebase ID token (`POST /sessions`, `POST /sessions/get-or-create`, `POST /sessions/renew/{sessionToken}`).
+        When the token includes `email`, the server best-effort stores it on the workspace end-user row.
+    sessionBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Session JWT from `POST /sessions` or `POST /sessions/renew/{sessionToken}` (`tokenType=SESSION`; subject = session id;
+        `tokenRevision` claim must match the server; superseded after renew)
+
+  responses:
+    BillingLimitExceeded:
+      description: |
+        Workspace billing plan limit reached. HTTP status is always **429 Too Many Requests**
+        (quota-style cap, not a payment-gateway response). Inspect **`code`** for the limit type.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BillingLimitError'
+          examples:
+            sessionLimit:
+              summary: Concurrent active session cap
+              value:
+                status: 429
+                code: BILLING_SESSION_LIMIT
+                error: workspace concurrent session limit reached (max 20)
+            payloadLimit:
+              summary: Decrypted payload byte cap
+              value:
+                status: 429
+                code: BILLING_PAYLOAD_LIMIT
+                error: session payload exceeds plan limit (max 2048 bytes)
+
+    BillingGraceLock:
+      description: |
+        Workspace is in **`grace_lock`** after the paid period ended without Free downgrade.
+        End-user session I/O is blocked (**HTTP 403**) with **`code: BILLING_GRACE_LOCK`**.
+        Payloads remain until grace expiry wipe (all active payloads cleared → Free) or successful
+        Free downgrade during grace.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BillingGraceLockError'
+          example:
+            status: 403
+            code: BILLING_GRACE_LOCK
+            error: Workspace is locked after paid period ended without Free downgrade; end-user session access is blocked until you Downgrade to Free (reduce usage first if over Free limits)
+
+  schemas:
+    ApiError:
+      type: object
+      required: [status, error]
+      properties:
+        status:
+          type: integer
+          description: HTTP status code
+        error:
+          type: string
+          description: Human-readable error message
+        code:
+          type: string
+          description: Stable machine-readable error code (billing limit errors only)
+          enum: [BILLING_SESSION_LIMIT, BILLING_PAYLOAD_LIMIT, BILLING_GRACE_LOCK]
+
+    BillingLimitError:
+      allOf:
+        - $ref: '#/components/schemas/ApiError'
+      required: [status, code, error]
+
+    BillingGraceLockError:
+      allOf:
+        - $ref: '#/components/schemas/ApiError'
+      required: [status, code, error]
+
+    SessionRequest:
+      type: object
+      required: [workspaceName]
+      properties:
+        workspaceName:
+          type: string
+          description: Workspace name to scope the session
+          example: demo-workspace
+        app_id:
+          type: string
+          nullable: true
+          description: Optional app id (must belong to the workspace). Used for per-app session policy and auditing.
+          example: acme-web
+        payload:
+          type: object
+          additionalProperties: true
+          default: {}
+          description: Arbitrary payload object stored in the session. Optional; omitted or null is stored as `{}`.
+          example:
+            hello: world
+            from: safehook demo
+
+    SessionIdentityView:
+      type: object
+      required: [userId, email]
+      properties:
+        userId:
+          type: integer
+          format: int64
+          nullable: true
+          description: >-
+            Stable, opaque id for this person across sessions/logins. Not a Firebase UID. Intended
+            correlation key for your own backend linking external events (e.g. billing webhooks) to
+            this user.
+          example: 42
+        email:
+          type: string
+          nullable: true
+          description: Workspace end-user email when known (from hosted login); null otherwise.
+          example: user@example.com
+
+    CreateSessionResponse:
+      type: object
+      required: [sessionToken]
+      properties:
+        sessionToken:
+          type: string
+          description: Internal JWT session token (tokenType=SESSION)
+          example: eyJhbGciOi...SESSION
+
+    SessionRenewResponse:
+      type: object
+      required: [sessionToken, payload]
+      properties:
+        sessionToken:
+          type: string
+          description: New internal JWT session token (tokenType=SESSION)
+        payload:
+          $ref: '#/components/schemas/SessionPayloadObject'
+
+    SessionPayloadObject:
+      type: object
+      additionalProperties: true
+      description: Decrypted key/value payload object
+      example:
+        hello: world
+        counter: 1
+
+    SetSessionValueRequest:
+      description: >
+        JSON body can be either `{ "value": <x> }` (preferred) or a raw JSON value.
+      oneOf:
+        - type: object
+          required: [value]
+          additionalProperties: false
+          properties:
+            value: {}
+        - type: string
+        - type: number
+        - type: integer
+        - type: boolean
+        - type: array
+        - type: object
+          additionalProperties: true
+        - type: 'null'
+
+    GetSessionValueResponse:
+      type: object
+      required: [key, value]
+      properties:
+        key:
+          type: string
+          example: hello
+        value:
+          description: Stored payload value for the requested key
+          example: world
+

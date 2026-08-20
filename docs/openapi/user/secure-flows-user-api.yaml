@@ -1,0 +1,3328 @@
+openapi: 3.1.0
+info:
+  title: secureFlows Management API
+  version: 1.8.0
+  description: |
+    REST API for **workspace owners/admins** and **end-user flows** (login, invites, anonymous, self-service).
+
+    Base path: **`/api/v1`**.
+
+    ### Workspace access policies
+    Each workspace has two independent toggles (see **`Workspace`**, **`WorkspaceCreateRequest`**, **`WorkspaceUpdateRequest`**):
+
+    | Field | Default | Controls |
+    |-------|---------|----------|
+    | **`acceptAnonimous`** | `true` | Whether anonymous Firebase users may join via **`POST /users/anonymous`** or session create without a prior invite |
+    | **`enableSelfService`** | `true` | Whether end users may use the self-service dashboard (**`GET /users/memberships`**, **`POST /users/login`** as `USER`/`ANONIMOUS`, **`GET /sessions/my`**, **`POST /sessions/revoke/{sessionId}`**) |
+
+    When **`enableSelfService`** is `false`, those self-service routes return **403** for end-user roles; **`ADMIN`** and **`OWNER`** console login via **`POST /users/login`** is unchanged.
+
+    ### Error responses
+    Failures return JSON **`{"status": <code>, "error": "<message>"}`** unless noted otherwise.
+    Billing plan limit failures use **HTTP 429** with stable **`code`** values
+    **`BILLING_SESSION_LIMIT`** or **`BILLING_PAYLOAD_LIMIT`** (see session create / payload write paths).
+
+    ### Firebase email (console, audit, integrated app UI)
+    Verified Firebase ID tokens may include an **`email`** claim. The server **best-effort** persists it on
+    the workspace user row when missing — on **`POST /users/login`**, **`GET /users`** (current page),
+    **`GET /users/{id}`**, session create/get-or-create/renew, and **`GET /auth/callback`** (create/renew).
+    This does not change authentication; it helps **`GET /users`**, **`GET /audit/events`**, and
+    **`GET /audit/api-access`** return emails instead of Firebase UIDs where possible. Clients do not
+    send email in request bodies.
+
+    **Integrated apps:** after sign-in, call **`GET /sessions/identity`** with the session token to display
+    the signed-in user's email in the app UI (e.g. next to **Sign out**) and to get a stable `userId` for
+    your own backend to correlate external events against. Response: `{ "userId": 42, "email": "…" }`,
+    either field may be `null`. Session **payload** remains on **`GET /sessions`** only.
+
+    ### Paging and sorting
+    Paged list endpoints return **`{ items, page, pageSize, totalItems, totalPages }`**. Page size is
+    clamped to **`[1, 200]`**; query **`pageSize=0`** means default **20** (except where noted below).
+
+    | Endpoint | Search (`q`) | Sort (`sort` / `dir`) |
+    |----------|----------------|------------------------|
+    | `GET /users` | email, name, UID, role, status, id | `email`, `name`, `role`, `status`, `id` |
+    | `GET /audit/events` | — | fixed newest-first |
+    | `GET /audit/api-access` | — | fixed newest-first |
+    | `GET /sessions/admin` | id, user, app | session columns (see path) |
+    | `GET /sessions/my` | id, app, status | session columns (see path) |
+    | `GET /sessions/admin/analytics/concurrent-sessions` | — | fixed date ascending |
+
+    Admin session list page size is fixed by server config (`sessions.admin.page-size`, default **10**).
+    Export uses `sessions.export.page-size` (default **100**).
+
+    ### Tokens
+    | Kind | Use |
+    |------|-----|
+    | **Firebase ID token** | `POST /workspaces` (create), `GET /users/memberships`, `POST /users/login`, `POST /users/from-invite`, `POST /users/anonymous`, `POST /sessions`, `POST /sessions/get-or-create`, `POST /sessions/renew/{sessionToken}` — header `Authorization: Bearer <firebase-jwt>` |
+    | **Internal USER JWT** | All other routes in this document — same header; issued by backend (`tokenType=USER`) |
+
+    ### Related specs
+    - **Hosted login & application registration**: see **`/docs/openapi/integration-auth.yaml`**
+    - **AI session API only**: **`/docs/openapi/session/secure-flows-session-api.yaml`**
+
+    Tags marked **`human-only`** describe console-style usage (not the session-only AI surface).
+
+tags:
+  - name: human-only
+    description: Console and human-driven flows (users, workspaces, invites)
+  - name: users
+    description: Workspace user directory (ADMIN/OWNER)
+  - name: applications
+    description: Registered applications and redirect allowlists (ADMIN/OWNER)
+  - name: audit
+    description: Workspace audit trail and HTTP API access log (ADMIN/OWNER read)
+  - name: ai-safe
+    description: Session lifecycle and payload keys (automation-safe subset)
+  - name: ai-optional
+    description: Automation-safe but not needed for the basic flow.
+
+paths:
+  /api/v1/users/login:
+    post:
+      summary: Exchange Firebase token for a backend JWT
+      description: |
+        Exchanges a Firebase ID token for a backend JWT scoped by `workspaceName`.
+        Authentication: `Authorization: Bearer <firebaseIdToken>`.
+
+        Used by the workspace console (**`ADMIN`** / **`OWNER`**) and by the self-service dashboard
+        (**`USER`** / **`ANONIMOUS`**). When the workspace has **`enableSelfService: false`**, end-user
+        roles receive **403**; admin console login still succeeds.
+
+        If the Firebase token includes **`email`** and the user row has none, the server best-effort
+        stores it (audit/console display only).
+      tags: [human-only]
+      security:
+        - firebaseBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserLoginRequest'
+            example:
+              workspaceName: demo-workspace
+      responses:
+        "200":
+          description: Backend JWT issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserLoginResponse'
+              example:
+                accessToken: eyJhbGciOi...USER
+        "401":
+          description: Unauthorized (invalid/missing Firebase token).
+          content:
+            application/json:
+              example:
+                error: Invalid token
+        "403":
+          description: Forbidden (self-service disabled for workspace and caller is USER or ANONIMOUS).
+          content:
+            application/json:
+              example:
+                error: Self-service is disabled for this workspace
+
+  /api/v1/users/memberships:
+    get:
+      summary: List workspaces for the signed-in Firebase account
+      description: |
+        Returns workspaces where the caller has an active user row (workspace picker).
+
+        Authentication: `Authorization: Bearer <firebaseIdToken>` — **Firebase ID token only**
+        (not an internal USER JWT).
+
+        **Default (`for` omitted or `self-service`):** self-service picker. Excludes soft-deleted users,
+        `SUPPORT` role memberships, workspaces with **`enableSelfService: false`**, and the reserved
+        support workspace.
+
+        **`for=workspace-management`:** workspace management console picker. Returns only `OWNER` /
+        `ADMIN` memberships (ignores `enableSelfService`). Same exclusions for soft-deleted, `SUPPORT`,
+        and reserved support workspace.
+
+        Support allowlisted Firebase accounts receive **403** (use `POST /users/support/login`).
+
+        Pair with `POST /users/login` and `workspaceName` when the account belongs to more than one workspace.
+      tags: [human-only]
+      security:
+        - firebaseBearerAuth: []
+      parameters:
+        - name: for
+          in: query
+          required: false
+          description: |
+            Membership list purpose. `self-service` (default) or `workspace-management` (OWNER/ADMIN only).
+          schema:
+            type: string
+            enum: [self-service, workspace-management]
+      responses:
+        "200":
+          description: Membership list (may be empty if the account has no eligible workspaces).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserWorkspaceMembershipListResponse'
+              example:
+                items:
+                  - workspaceId: 42
+                    workspaceName: demo-workspace
+                    role: USER
+                  - workspaceId: 99
+                    workspaceName: acme-corp
+                    role: ADMIN
+        "400":
+          description: Invalid `for` query parameter.
+          content:
+            application/json:
+              example:
+                error: Invalid for parameter; use self-service or workspace-management
+        "401":
+          description: Unauthorized (invalid/missing Firebase token).
+          content:
+            application/json:
+              example:
+                error: Invalid token
+        "403":
+          description: Forbidden (support operator account — use support login).
+          content:
+            application/json:
+              example:
+                error: Use support login for this account
+
+  /api/v1/users/from-invite:
+    post:
+      summary: Create a user from an invite secret key
+      description: >
+        Validates a Firebase ID token and resolves an invite using `secretKey`,
+        then creates the user in the invite-scoped workspace.
+        Authentication: `Authorization: Bearer <firebaseIdToken>`.
+      tags: [human-only]
+      security:
+        - firebaseBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserFromInviteRequest'
+            example:
+              secretKey: invite-secret-uuid
+      responses:
+        "200":
+          description: User created/resolved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDto'
+              example:
+                id: 1
+                workspaceId: 1
+                role: USER
+                providerUid: p2G3qPWP8sZYST3cCORPUZCbXN72
+                userName: null
+                email: user@example.com
+                status: active
+                authProvider: FIREBASE
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              example:
+                error: Invalid token
+        "403":
+          description: Forbidden (invalid invite/token).
+
+  /api/v1/users/anonymous:
+    post:
+      summary: Create or return an anonymous user in a workspace
+      description: >
+        Validates Firebase token, loads the workspace by name, checks whether anonymous
+        users are accepted, and ensures an anonymous user exists for the Firebase UID.
+        Authentication: `Authorization: Bearer <firebaseIdToken>`.
+      tags: [human-only]
+      security:
+        - firebaseBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnonymousUserRequest'
+            example:
+              workspaceName: demo-workspace
+      responses:
+        "200":
+          description: Anonymous user returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDto'
+              example:
+                id: 2
+                workspaceId: 1
+                role: ANONIMOUS
+                providerUid: Sq2jnvqLDaWVAb93zfEpV86YiA2
+                userName: null
+                email: anon@example.com
+                status: active
+                authProvider: FIREBASE
+        "403":
+          description: Forbidden if the workspace does not accept anonymous users.
+
+  /api/v1/users:
+    get:
+      summary: List users in the caller's workspace (paged)
+      description: |
+        Paged user list for the workspace in the **internal USER JWT** (`workspace` claim). Requires
+        workspace **ADMIN** or **OWNER**.
+
+        Query **`q`** searches email, user name, Firebase UID, role, status, and numeric id.
+        **`sort`**: `email` (default), `name`, `role`, `status`, `id`. **`dir`**: `asc` (default) or `desc`.
+        **`pageSize`**: `0` means default **20** (clamped to `[1, 200]`).
+
+        For FIREBASE users with a missing `email` on the current page, the server **best-effort** loads
+        email from Firebase Admin, persists it, and returns it in the response.
+      tags: [users, human-only]
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: pageSize
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 200
+            default: 0
+          description: "0 = default 20; max 200"
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Search email, name, provider UID, role, status, or id
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [email, name, role, status, id]
+            default: email
+        - name: dir
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: asc
+      responses:
+        "200":
+          description: Paged users list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPageResponse'
+              example:
+                items:
+                  - id: 1
+                    workspaceId: 1
+                    role: OWNER
+                    providerUid: p2G3qPWP8sZYST3cCORPUZCbXN72
+                    userName: null
+                    email: owner@example.com
+                    status: active
+                    authProvider: FIREBASE
+                page: 0
+                pageSize: 20
+                totalItems: 1
+                totalPages: 1
+        "401":
+          description: Missing or invalid USER token
+        "403":
+          description: Requires workspace ADMIN or OWNER
+
+  /api/v1/users/{id}:
+    get:
+      summary: Get a user by ID
+      description: |
+        Returns a user by numeric ID in the caller's workspace (`404` if absent). Best-effort Firebase
+        email backfill applies when `email` is missing (see `GET /users`).
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          example: 1
+      responses:
+        "200":
+          description: User returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDto'
+              example:
+                id: 1
+                workspaceId: 1
+                role: OWNER
+                providerUid: p2G3qPWP8sZYST3cCORPUZCbXN72
+                userName: null
+                email: owner@example.com
+                status: active
+                authProvider: FIREBASE
+        "401":
+          description: Unauthorized
+        "404":
+          description: User not found
+
+    patch:
+      summary: Update a user
+      description: >
+        Updates a user with the given ID.
+        Authentication: internal user JWT (tokenType=USER).
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          example: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserDto'
+            example:
+              workspaceId: 1
+              role: USER
+              providerUid: p2G3qPWP8sZYST3cCORPUZCbXN72
+              userName: bob
+              email: bob@example.com
+              status: active
+              authProvider: FIREBASE
+      responses:
+        "200":
+          description: Updated user returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDto'
+              example:
+                id: 1
+                workspaceId: 1
+                role: USER
+                providerUid: p2G3qPWP8sZYST3cCORPUZCbXN72
+                userName: bob
+                email: bob@example.com
+                status: active
+                authProvider: FIREBASE
+
+    delete:
+      summary: Delete a user
+      description: Deletes the user with the given numeric ID.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          example: 1
+      responses:
+        "204":
+          description: User deleted.
+        "404":
+          description: User not found
+
+  /api/v1/workspaces:
+    post:
+      summary: Create a workspace
+      description: |
+        Creates a workspace, provisions an **OWNER** user for the caller's Firebase UID, seeds
+        **`workspace_billing`** with the selected catalog plan (defaults to **free** when
+        **`planName`** is omitted), and returns **`accessToken`** — an internal **USER** JWT with
+        **OWNER** role for that workspace.
+
+        Use this token for **GET/PATCH /workspaces**, **/invites**, **/applications**, etc.
+
+        **Authentication:** Firebase ID token — `Authorization: Bearer <firebaseIdToken>`.
+      tags: [human-only]
+      security:
+        - firebaseBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkspaceCreateRequest'
+            examples:
+              create:
+                summary: New tenant on Base plan
+                value:
+                  name: demo-workspace
+                  acceptAnonimous: true
+                  enableSelfService: true
+                  planName: base
+      responses:
+        "200":
+          description: |
+            **`workspace`**: persisted tenant. **`accessToken`**: OWNER USER JWT (store securely).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceCreateResponse'
+              examples:
+                ok:
+                  value:
+                    workspace:
+                      id: 1
+                      name: demo-workspace
+                      acceptAnonimous: true
+                      enableSelfService: true
+                    accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.OWNER...
+        "400":
+          description: Invalid input or duplicate name
+          content:
+            application/json:
+              example:
+                message: Validation failed
+        "401":
+          description: Missing or invalid Firebase token
+          content:
+            application/json:
+              example:
+                error: Missing Authorization header
+
+    get:
+      summary: Get the caller's workspace
+      description: |
+        Returns the workspace for the **`workspace` / `workspaceId` claim** in the **USER** JWT.
+        Caller must be **ADMIN** or **OWNER**.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      responses:
+        "200":
+          description: Workspace returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+              example:
+                id: 1
+                name: demo-workspace
+                acceptAnonimous: true
+                enableSelfService: true
+        "403":
+          description: USER token missing or not ADMIN/OWNER
+        "404":
+          description: Workspace not found
+
+    patch:
+      summary: Update the caller's workspace
+      description: |
+        Partial update: only non-null fields in the body are applied. Caller must be **ADMIN** or **OWNER**.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkspaceUpdateRequest'
+            example:
+              acceptAnonimous: false
+              enableSelfService: false
+      responses:
+        "200":
+          description: Workspace updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+              example:
+                id: 1
+                name: demo-workspace
+                acceptAnonimous: false
+                enableSelfService: false
+
+  /api/v1/workspaces/billing:
+    get:
+      summary: Get workspace billing (plan, limits, usage)
+      description: |
+        Returns the caller's workspace billing snapshot: assigned **plan**, **effective** session and
+        payload limits (plan defaults with optional overrides), **`billingStatus`**, current
+        **usage**, and payment UX flags (**`checkoutAvailable`**, **`cancelAvailable`**,
+        **`resumeAvailable`**, **`overFreeTierLimits`**, cancel/grace timestamps when applicable).
+
+        Workspace scope is taken from the USER JWT — there is no workspace id in the URL.
+
+        When **`billingStatus` is `grace_lock`**, end-user session APIs return **403** with
+        **`BILLING_GRACE_LOCK`**; **`graceEndsAt`** is the wipe countdown. Owners can still
+        list/revoke sessions and **Downgrade to Free**.
+
+        After grace expiry wipe (**Milestone 3**), the snapshot returns **`planName: free`**,
+        **`billingStatus: beta`** (or normal Free status), **`graceEndsAt: null`**, cleared cancel
+        markers, and **`usage.activeSessionCount: 0`** (active payloads were wiped).
+
+        **`__support__`** and other non-billable workspaces return **404**.
+
+        **Authentication:** USER JWT — **OWNER**, **ADMIN**, or **SUPPORT**.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      responses:
+        "200":
+          description: Billing snapshot returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceBillingResponse'
+              examples:
+                betaFree:
+                  summary: Free / beta
+                  value:
+                    planName: free
+                    effectiveMaxConcurrentSessions: 20
+                    effectiveMaxPayloadBytes: 2048
+                    overrideMaxConcurrentSessions: null
+                    overrideMaxPayloadBytes: null
+                    billingStatus: beta
+                    usage:
+                      activeSessionCount: 3
+                      largestActivePayloadBytes: 512
+                    checkoutAvailable: false
+                    cancelAvailable: false
+                    paidPeriodEndsAt: null
+                    cancelRequestedAt: null
+                    overFreeTierLimits: false
+                    resumeAvailable: false
+                    graceEndsAt: null
+                graceLock:
+                  summary: Period ended without Free (M2)
+                  value:
+                    planName: base
+                    effectiveMaxConcurrentSessions: 100
+                    effectiveMaxPayloadBytes: 4096
+                    overrideMaxConcurrentSessions: null
+                    overrideMaxPayloadBytes: null
+                    billingStatus: grace_lock
+                    usage:
+                      activeSessionCount: 5
+                      largestActivePayloadBytes: 900
+                    checkoutAvailable: true
+                    paymentProvider: paddle
+                    cancelAvailable: false
+                    paidPeriodEndsAt: "2026-07-14T00:00:00Z"
+                    cancelRequestedAt: "2026-06-14T12:00:00Z"
+                    overFreeTierLimits: true
+                    resumeAvailable: false
+                    graceEndsAt: "2026-07-28T00:00:00Z"
+                afterGraceWipe:
+                  summary: Free after grace expiry wipe (M3)
+                  value:
+                    planName: free
+                    effectiveMaxConcurrentSessions: 20
+                    effectiveMaxPayloadBytes: 2048
+                    overrideMaxConcurrentSessions: null
+                    overrideMaxPayloadBytes: null
+                    billingStatus: beta
+                    usage:
+                      activeSessionCount: 0
+                      largestActivePayloadBytes: null
+                    checkoutAvailable: true
+                    paymentProvider: paddle
+                    cancelAvailable: false
+                    paidPeriodEndsAt: null
+                    cancelRequestedAt: null
+                    overFreeTierLimits: false
+                    resumeAvailable: false
+                    graceEndsAt: null
+        "403":
+          description: USER token missing or role is not OWNER, ADMIN, or SUPPORT
+        "404":
+          description: Workspace not found or not billable
+
+    patch:
+      summary: Update workspace billing (plan and/or SUPPORT overrides)
+      description: |
+        Partial update. Supported fields:
+
+        - **`planName`** (`free` | `base` | `pro`) — **OWNER**, **ADMIN**, or **SUPPORT**; allowed only
+          when **`billingStatus` is `beta`** (no payment), **except** downgrade to **`free`** on a paid
+          workspace (stops charging + clears cancel markers).
+        - **`overrideMaxConcurrentSessions`**, **`overrideMaxPayloadBytes`** — **SUPPORT only**;
+          JSON **`null`** clears the override; omitted fields are unchanged.
+
+        Lower effective limits (plan downgrade or tighter override) run the usage guard — **409** when
+        active sessions or payloads exceed the new caps.
+
+        When payment is enabled and the workspace is **not** Beta: upgrades use checkout; the only
+        allowed **`planName`** here is **`free`** (self-service downgrade — also cancels provider
+        charging). Other paid plan changes return **402**.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkspaceBillingUpdateRequest'
+            examples:
+              planChange:
+                summary: Beta plan upgrade
+                value:
+                  planName: base
+              supportOverride:
+                summary: SUPPORT session cap override
+                value:
+                  overrideMaxConcurrentSessions: 2
+              clearOverride:
+                summary: Clear payload override
+                value:
+                  overrideMaxPayloadBytes: null
+      responses:
+        "200":
+          description: Updated billing snapshot (same shape as GET).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceBillingResponse'
+        "400":
+          description: Invalid field values or unknown plan name
+        "402":
+          description: Non-beta workspace; paid upgrades require checkout (Free downgrade still allowed)
+        "403":
+          description: Insufficient role (e.g. OWNER setting overrides)
+        "404":
+          description: Workspace not found or not billable
+        "409":
+          description: |
+            Downgrade blocked: current usage exceeds target plan limits. Body includes
+            **`code: BILLING_DOWNGRADE_BLOCKED`** and **`details`** with counts and limits.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingDowngradeBlockedError'
+              example:
+                status: 409
+                code: BILLING_DOWNGRADE_BLOCKED
+                error: Cannot downgrade plan; revoke sessions or shrink payloads and retry.
+                details:
+                  targetPlan: free
+                  activeSessionCount: 25
+                  maxConcurrentSessionsAllowed: 20
+                  sessionsOverLimit: true
+                  largestActivePayloadBytes: 3000
+                  maxPayloadBytesAllowed: 2048
+                  payloadOverLimit: true
+
+  /api/v1/workspaces/billing/checkout:
+    post:
+      summary: Start hosted checkout for a paid plan
+      description: |
+        Creates a provider checkout session (Paddle sandbox when payment integration is enabled).
+
+        **Free** is rejected (**400**) — downgrade to Free uses `PATCH` / cancel flow, not checkout.
+
+        When payment integration is disabled (**production Beta**), returns **501**.
+
+        **Authentication:** USER JWT — **OWNER** or **ADMIN**.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillingCheckoutRequest'
+            example:
+              planName: base
+              successUrl: https://app.example/workspaces?billing=success
+              cancelUrl: https://app.example/workspaces?billing=canceled
+      responses:
+        "200":
+          description: Checkout session created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingCheckoutResponse'
+              example:
+                checkoutUrl: https://checkout.paddle.com/...
+                provider: paddle
+                externalSessionId: txn_01h...
+                paddleClientToken: test_...
+                paddleEnvironment: sandbox
+        "400":
+          description: Missing fields or unsupported plan (e.g. free)
+        "403":
+          description: Role is not OWNER or ADMIN
+        "501":
+          description: Payment integration disabled
+
+  /api/v1/workspaces/billing/cancel:
+    post:
+      summary: Cancel paid subscription (stop auto-renewal)
+      description: |
+        Stops provider auto-renewal for the workspace subscription. **Does not** change the catalog
+        plan, wipe sessions, or lock the workspace. Paid entitlements continue until
+        **`paidPeriodEndsAt`**.
+
+        Customer must **downgrade to Free** themselves (`PATCH` with `planName: free`) before
+        period end after reducing usage if over Free limits. Free downgrade also cancels charging.
+
+        To undo cancel while still **`canceling`**, use **`POST /workspaces/billing/resume`**
+        (clears Paddle scheduled cancel; returns to **`active`**).
+
+        Idempotent when already **`canceling`**.
+
+        Available only when payment/checkout is configured (staging). Production Beta returns **501**.
+
+        **Authentication:** USER JWT — **OWNER** or **ADMIN**.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      responses:
+        "200":
+          description: Cancel requested; plan unchanged (`billingStatus` becomes `canceling`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceBillingResponse'
+              example:
+                planName: base
+                effectiveMaxConcurrentSessions: 100
+                effectiveMaxPayloadBytes: 4096
+                overrideMaxConcurrentSessions: null
+                overrideMaxPayloadBytes: null
+                billingStatus: canceling
+                usage:
+                  activeSessionCount: 5
+                  largestActivePayloadBytes: 1024
+                checkoutAvailable: true
+                paymentProvider: paddle
+                cancelAvailable: true
+                paidPeriodEndsAt: "2026-08-14T00:00:00Z"
+                cancelRequestedAt: "2026-07-14T12:00:00Z"
+                overFreeTierLimits: false
+                resumeAvailable: true
+                graceEndsAt: null
+        "400":
+          description: Not eligible (Free / Beta / nothing to cancel)
+        "403":
+          description: Role is not OWNER or ADMIN
+        "501":
+          description: Payment integration disabled or not configured
+
+  /api/v1/workspaces/billing/resume:
+    post:
+      summary: Resume subscription after cancel (undo stop-renewal)
+      description: |
+        Removes the provider scheduled cancellation (`PATCH` subscription
+        `scheduled_change: null` on Paddle) so auto-renewal continues.
+        Clears cancel markers and sets **`billingStatus`** back to **`active`**.
+        Plan unchanged.
+
+        Available only while **`billingStatus` is `canceling`** and payment/checkout is configured
+        (`resumeAvailable` on GET billing).
+
+        **Authentication:** USER JWT — **OWNER** or **ADMIN**.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      responses:
+        "200":
+          description: Subscription resume applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceBillingResponse'
+              example:
+                planName: base
+                effectiveMaxConcurrentSessions: 100
+                effectiveMaxPayloadBytes: 4096
+                overrideMaxConcurrentSessions: null
+                overrideMaxPayloadBytes: null
+                billingStatus: active
+                usage:
+                  activeSessionCount: 5
+                  largestActivePayloadBytes: 1024
+                checkoutAvailable: true
+                paymentProvider: paddle
+                cancelAvailable: true
+                paidPeriodEndsAt: null
+                cancelRequestedAt: null
+                overFreeTierLimits: false
+                resumeAvailable: false
+                graceEndsAt: null
+        "400":
+          description: Not eligible (not currently canceling)
+        "403":
+          description: Role is not OWNER or ADMIN
+        "501":
+          description: Payment integration disabled or not configured
+
+  /api/v1/workspaces/billing/test/enter-grace-lock:
+    post:
+      summary: Test classpath only — force period-end → grace_lock
+      description: |
+        **Not a product API.** Present only when the server is started from the **test classpath**
+        (Newman IT via `SecureFlowsBillingPaymentTest`) **and**
+        **`billing.payment.stub-checkout=true`**. Absent from staging/production jars.
+
+        Requires the workspace to already be **`canceling`**. Rewinds **`paidPeriodEndsAt`**
+        into the past and transitions to **`grace_lock`** (sets **`graceEndsAt`**).
+
+        **Authentication:** USER JWT — **OWNER** or **ADMIN**.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      responses:
+        "200":
+          description: Workspace entered (or already in) `grace_lock`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceBillingResponse'
+              example:
+                planName: base
+                billingStatus: grace_lock
+                cancelAvailable: false
+                resumeAvailable: false
+                graceEndsAt: "2026-07-29T12:00:00Z"
+        "400":
+          description: Workspace is not `canceling` / `grace_lock`
+        "403":
+          description: Role is not OWNER or ADMIN
+        "404":
+          description: Endpoint absent (not on test classpath / stub-checkout off) or workspace not billable
+
+  /api/v1/workspaces/billing/test/complete-grace-wipe:
+    post:
+      summary: Test classpath only — force grace expiry wipe → Free
+      description: |
+        **Not a product API.** Present only when the server is started from the **test classpath**
+        (Newman IT via `SecureFlowsBillingPaymentTest`) **and**
+        **`billing.payment.stub-checkout=true`**. Absent from staging/production jars.
+
+        Requires the workspace to already be **`grace_lock`**. Rewinds **`graceEndsAt`**
+        into the past, wipes **all** active session payloads, and lands on **Free**
+        (clears cancel/grace/payment markers).
+
+        **Authentication:** USER JWT — **OWNER** or **ADMIN**.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      responses:
+        "200":
+          description: Workspace completed grace wipe (or already Free after prior wipe).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceBillingResponse'
+              example:
+                planName: free
+                billingStatus: beta
+                cancelAvailable: false
+                resumeAvailable: false
+                graceEndsAt: null
+                usage:
+                  activeSessionCount: 0
+                  largestActivePayloadBytes: null
+        "400":
+          description: Workspace is not `grace_lock`
+        "403":
+          description: Role is not OWNER or ADMIN
+        "404":
+          description: Endpoint absent (not on test classpath / stub-checkout off) or workspace not billable
+
+  /api/v1/invites:
+    post:
+      summary: Create an invite
+      description: |
+        Creates an invite for the caller's workspace. **`role`** must be **`admin`** or **`user`**
+        (lowercase). **`ttlSeconds`** is the lifetime in seconds from creation.
+
+        **Authentication:** USER JWT with **ADMIN** or **OWNER**.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InviteCreateRequest'
+            examples:
+              adminInvite:
+                value:
+                  role: admin
+                  ttlSeconds: 3600
+              userInvite:
+                value:
+                  role: user
+                  ttlSeconds: 86400
+      responses:
+        "200":
+          description: Invite created (secret key returned once).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteCreateResponse'
+              example:
+                secretKey: invite-secret-123
+                expiresAt: "2026-03-26T12:34:56Z"
+
+    get:
+      summary: List invites for the caller workspace (paged)
+      description: |
+        Paged list for the workspace admin console. Query params match `GET /users`:
+        `page`, `pageSize`, `q`, `sort`, `dir`. Also `includeUsed` (default `false`) hides
+        consumed invites. Sort keys: `createdAt` (default, desc), `role`, `expiresAt`, `status`, `id`.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Zero-based page index
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Page size; `0` means server default (20), clamped to `[1, 200]`
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Search id, role, status, or secret key
+        - name: sort
+          in: query
+          schema:
+            type: string
+            default: createdAt
+            enum: [createdAt, role, expiresAt, status, id]
+        - name: dir
+          in: query
+          schema:
+            type: string
+            default: desc
+            enum: [asc, desc]
+        - name: includeUsed
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: When false, excludes invites with status `used`
+      responses:
+        "200":
+          description: Paged invite list returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitePageResponse'
+              example:
+                items:
+                  - id: 10
+                    role: admin
+                    expiresAt: "2026-03-26T12:34:56Z"
+                    status: active
+                    createdAt: "2026-03-26T11:34:56Z"
+                page: 0
+                pageSize: 25
+                totalItems: 1
+                totalPages: 1
+
+  /api/v1/invites/{id}:
+    get:
+      summary: Get invite by ID (includes secret key)
+      description: >
+        Returns invite details (including secret key) for the caller's workspace.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          example: 10
+      responses:
+        "200":
+          description: Invite details returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteDetailResponse'
+              example:
+                id: 10
+                secretKey: invite-secret-123
+                role: admin
+                expiresAt: "2026-03-26T12:34:56Z"
+                status: active
+                createdAt: "2026-03-26T11:34:56Z"
+
+    delete:
+      summary: Revoke an invite
+      description: Revokes the invite by ID for the caller's workspace.
+      tags: [human-only]
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          example: 10
+      responses:
+        "204":
+          description: Invite revoked.
+
+  /api/v1/applications:
+    post:
+      tags: [applications]
+      summary: Register an application
+      description: |
+        Creates an application record under the workspace carried in the USER JWT (**ADMIN** or **OWNER**).
+      security:
+        - userBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClientAppRequest'
+      responses:
+        "200":
+          description: Application created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientAppResponse'
+        "400":
+          description: Validation error
+        "403":
+          description: Forbidden
+        "409":
+          description: Duplicate appId
+
+    get:
+      tags: [applications]
+      summary: List applications for workspace (paged)
+      description: |
+        Paged list for the workspace admin console. Query params match `GET /users`:
+        `page`, `pageSize`, `q`, `sort`, `dir`. Sort keys: `displayName` (default), `appId`, `id`.
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Zero-based page index
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Page size; `0` means server default (20), clamped to `[1, 200]`
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Search displayName, appId (clientId), or numeric id
+        - name: sort
+          in: query
+          schema:
+            type: string
+            default: displayName
+            enum: [displayName, appId, id]
+        - name: dir
+          in: query
+          schema:
+            type: string
+            default: asc
+            enum: [asc, desc]
+      responses:
+        "200":
+          description: Paged applications
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientAppPageResponse'
+        "403":
+          description: Forbidden
+
+  /api/v1/applications/{appId}:
+    get:
+      tags: [applications]
+      summary: Get one application by id
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: appId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: acme-web
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientAppResponse'
+        "403":
+          description: Forbidden
+        "404":
+          description: Not found
+
+    patch:
+      tags: [applications]
+      summary: Update display name and/or redirect URIs
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: appId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: acme-web
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClientAppPatchBody'
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientAppResponse'
+        "403":
+          description: Forbidden
+        "404":
+          description: Not found
+
+    delete:
+      tags: [applications]
+      summary: Delete an application
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: appId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: acme-web
+      responses:
+        "200":
+          description: Deleted
+        "403":
+          description: Forbidden
+        "404":
+          description: Not found
+
+  /api/v1/applications/{appId}/redirect-uris:
+    post:
+      tags: [applications]
+      summary: Atomically append one redirect URI to the allowlist
+      description: |
+        Idempotent: no-op (no audit event) if the URI is already present. Unlike `PATCH
+        /applications/{appId}`, this never replaces the existing `redirectUris` set, so it is safe to
+        call concurrently without a read-modify-write race.
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: appId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: acme-web
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppendRedirectUriRequest'
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientAppResponse'
+        "400":
+          description: redirectUri is required
+        "403":
+          description: Forbidden
+        "404":
+          description: Not found
+
+  /api/v1/audit/events:
+    get:
+      tags: [audit, human-only]
+      summary: List workspace audit events (paged)
+      description: |
+        Append-only workspace audit trail for the authenticated workspace (**ADMIN** or **OWNER**).
+        Payload contents are never stored or returned.
+
+        **User / actor columns:** Prefer **`sessionUserEmail`** and **`actorEmail`** when the linked user
+        row has an email (populated from Firebase on login and session flows). When email is missing,
+        **`sessionUserIdentifier`** / **`actorProviderUid`** fall back to the Firebase UID.
+
+        **Billing limit enforcement:** When a plan cap blocks session create or payload write, the server
+        returns HTTP **429** to the client and may record a throttled audit row:
+        **`BILLING_SESSION_LIMIT_EXCEEDED`** or **`BILLING_PAYLOAD_LIMIT_EXCEEDED`** (at most one per
+        workspace and limit type per hour). Metadata includes `code`, `planLimit`, `observedValue`, and
+        optional `appId` — see **`metadataJson`** on the event view.
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: pageSize
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 200
+            default: 20
+          description: "Default 20 when omitted; `0` is treated as 20. Max 200. Newest-first."
+      responses:
+        "200":
+          description: Paged audit events (newest first).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceAuditEventPageResponse'
+        "401":
+          description: Missing or invalid USER token
+        "403":
+          description: Requires workspace ADMIN or OWNER
+
+  /api/v1/audit/api-access:
+    get:
+      tags: [audit, human-only]
+      summary: List workspace HTTP API access log (paged)
+      description: |
+        Paged HTTP access log for the workspace (**ADMIN** or **OWNER**). Method, path,
+        status, and timing only — no request/response bodies.
+
+        **User column:** Prefer **`userEmail`** when the session owner has an email on file (best-effort
+        from Firebase on login/session flows). When email is absent, **`userFirebaseId`** is returned so
+        clients can show the Firebase UID instead of a blank value. Rows with **`sessionId`** also enrich
+        identity from the live session row when the log row omitted **`userFirebaseId`**.
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: pageSize
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 200
+            default: 20
+          description: "Default 20 when omitted; `0` is treated as 20. Max 200. Newest-first."
+      responses:
+        "200":
+          description: Paged API access log entries (newest first).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiAccessLogPageResponse'
+        "401":
+          description: Missing or invalid USER token
+        "403":
+          description: Requires workspace ADMIN or OWNER
+
+  /api/v1/applications/validate-redirect:
+    post:
+      tags: [applications]
+      summary: Validate app id + redirect URI (public)
+      description: |
+        **No authentication.** Used by hosted login before redirecting to the third-party app.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RedirectValidationRequest'
+      responses:
+        "200":
+          description: Always 200; check `valid` and `reason`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RedirectValidationResponse'
+
+  /api/v1/auth/callback:
+    get:
+      tags: [ai-safe]
+      summary: Session login callback (redirect)
+      description: |
+        **Browser redirect endpoint** used after hosted `/app/sessions/login`. No `Authorization` header.
+
+        1. Verifies **`firebaseToken`** (Firebase ID token).
+        2. Ensures **`client_redirect_uri`** is allowlisted for **`app_id`** (same rules as `validate-redirect`).
+        3. **Create vs renew:** If **`session_token`** is absent, **reuses the newest active session** for
+           **`(workspace_name, Firebase UID, app_id)`** or **creates** one (`get-or-create`). Optional
+           **`payload`** (URL-encoded JSON **object**, default `{}`) is stored **only on create** — ignored when
+           reusing an existing session. If **`session_token`** is present (previous session JWT, may be expired),
+           **renews** that session; **`payload`** must **not** be sent on the same request. Optional
+           **`ttl_seconds`** applies to both paths (default **0** = unlimited; otherwise **60–604800**). When the
+           Firebase token includes **`email`**, the server best-effort persists or backfills it on the workspace
+           end-user row (audit display only).
+        4. Responds with **`302 Found`** to `client_redirect_uri` with query params **`sessionToken`**
+           and, if provided, **`state`**.
+
+        If **`client_redirect_uri`** is not allowed for **`app_id`**, responds **`400`** and does **not**
+        redirect (open-redirect mitigation). Other failures return an HTTP error status with a JSON
+        **`{"status", "error"}`** body and do **not** redirect.
+      operationId: authSessionCallback
+      parameters:
+        - name: firebaseToken
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: client_redirect_uri
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uri
+        - name: workspace_name
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: app_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: ttl_seconds
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 604800
+          description: "Session lifetime in seconds (default 0 = unlimited; allowed values: 0 or 60–604800)"
+        - name: payload
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            JSON object as a string (e.g. `{"a":1}`), URL-encoded. Must parse to a JSON object (not an array or primitive).
+            Default when omitted is `{}`. Must not be combined with `session_token` on the same request.
+        - name: session_token
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Previous session JWT (may be expired); signature must validate. When present, the server renews this
+            session instead of creating a new one. Must not be combined with `payload` on the same request.
+            URL-encode the value; very long URLs may exceed browser or proxy limits.
+      responses:
+        "302":
+          description: Redirect to `client_redirect_uri` with `sessionToken` and optional `state`, or with `error` / `error_description`.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        "400":
+          description: Missing parameter or `client_redirect_uri` not allowlisted for `app_id`.
+
+  /api/v1/auth/logout:
+    get:
+      tags: [ai-safe]
+      summary: Log out (browser redirect helper; first-party cookie clearing)
+      description: |
+        Browser-friendly logout endpoint for **cross-site** clients (e.g. apps running on `localhost`).
+
+        Use this as a **top-level navigation** (not XHR/fetch) so `Clear-Site-Data` is applied in a
+        **first-party** context on `secure-flows.com`, making cookie/session clearing reliable even when
+        third-party cookies are blocked.
+
+        **Critical client rules:**
+        - Clear your in-app `sessionToken` state **before** navigating.
+        - **Never** include `session_token` inside `redirect_uri` (that would silently renew and defeat logout).
+
+        This endpoint (best-effort / idempotent for browser UX):
+        - Invalidates the provided `session_token` by incrementing `tokenRevision` when the token still
+          matches an **active** session (no new token is issued).
+        - If the session is already expired/revoked or the revision was superseded by renew, still
+          completes logout UX (does **not** return 401 solely for that reason).
+        - Revokes Firebase refresh tokens for the session’s stored Firebase UID when known.
+        - Sets `Clear-Site-Data: "cookies"`.
+        - Redirects the browser to `redirect_uri`.
+      parameters:
+        - name: session_token
+          in: query
+          required: true
+          schema:
+            type: string
+          description: SESSION JWT to invalidate (URL-encoded)
+        - name: redirect_uri
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uri
+          description: Where to redirect after logout completes
+      responses:
+        "302":
+          description: Redirect to `redirect_uri` after logout.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+            Clear-Site-Data:
+              schema:
+                type: string
+              example: "\"cookies\""
+        "400":
+          description: Missing redirect_uri.
+        "401":
+          description: Missing or cryptographically invalid session_token (not merely expired / superseded).
+
+    post:
+      tags: [ai-safe]
+      summary: Log out (invalidate sessionToken + revoke Firebase refresh tokens)
+      description: |
+        Logs out the current session **without revoking** it.
+
+        **Browser warning:** calling this endpoint via XHR/fetch from a different origin than `secure-flows.com`
+        is not a reliable way to clear hosted-login cookies. For browser apps (especially localhost), prefer the
+        redirect helper `GET /api/v1/auth/logout?session_token=...&redirect_uri=...`.
+
+        Behavior:
+        - **Invalidates** the current `sessionToken` by incrementing `tokenRevision` (no new token is issued).
+        - Calls Firebase `revokeRefreshTokens(firebaseUid)` using the session’s stored Firebase UID.
+        - Sets `Clear-Site-Data: "cookies"` to clear browser cookies (including Firebase session cookie).
+
+        Session payload and session row are **not** deleted or modified (other than `tokenRevision`).
+      security:
+        - sessionBearerAuth: []
+      responses:
+        "200":
+          description: Logged out.
+          headers:
+            Clear-Site-Data:
+              schema:
+                type: string
+              example: "\"cookies\""
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [loggedOut]
+                properties:
+                  loggedOut:
+                    type: boolean
+                    example: true
+              example:
+                loggedOut: true
+        "401":
+          description: Missing or invalid sessionToken.
+        "404":
+          description: Session not found.
+
+  /api/v1/sessions:
+    post:
+      tags: [ai-safe]
+      summary: Create a new session
+      description: |
+        Verifies **Firebase** ID token, creates a session for **`workspaceName`**, stores serialized
+        **`payload`**, and returns **`sessionToken`** (JWT; `tokenType=SESSION`).
+
+        If the Firebase token includes **`email`**, the server best-effort persists it on the workspace
+        end-user row. Prefer **`POST /sessions/get-or-create`** for hosted-login-style session reuse.
+      security:
+        - firebaseBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionRequest'
+      responses:
+        "200":
+          description: Session created successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessionToken]
+                properties:
+                  sessionToken:
+                    type: string
+        "401":
+          description: Missing or invalid Firebase Authorization header.
+        "429":
+          $ref: '#/components/responses/BillingLimitExceeded'
+
+    get:
+      tags: [ai-safe]
+      summary: Get the current session payload
+      security:
+        - sessionBearerAuth: []
+      responses:
+        "200":
+          description: Session payload returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionPayload'
+        "401":
+          description: Missing or invalid internal session token.
+
+  /api/v1/sessions/identity:
+    get:
+      tags: [ai-safe]
+      summary: Get signed-in user's stable id and email (app UI, backend correlation)
+      description: |
+        Returns the workspace end-user's **`userId`** and **email** for the authenticated session
+        token. Does not return Firebase UID or session payload.
+
+        `userId` is a stable, opaque identifier for this person across sessions and logins — it is
+        **not** derived from Firebase. Use it as the correlation key when your own backend needs to
+        link an external event (e.g. a billing provider webhook you receive and verify yourself)
+        back to this user. Do not use the session token or session id for this — sessions expire and
+        rotate, `userId` does not.
+
+        Email is best-effort from hosted login (Firebase `email` claim persisted on the user row).
+        When unknown, `email` is `null`. Use **`secureflows-js`** **`fetchSessionIdentity(token)`** when
+        using the browser SDK (≥ 0.1.15 for `userId`).
+      security:
+        - sessionBearerAuth: []
+      responses:
+        "200":
+          description: Session identity returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionIdentityView'
+              example:
+                userId: 42
+                email: user@example.com
+        "401":
+          description: Missing or invalid internal session token.
+        "410":
+          description: Session token expired.
+
+  /api/v1/sessions/get-or-create:
+    post:
+      tags: [ai-safe]
+      summary: Reuse active session or create one
+      description: |
+        Verifies **Firebase** ID token. Reuses the **newest active** session for
+        **`(workspaceName, Firebase UID, app_id)`** or creates a new session (same body as **`POST /sessions`**).
+        Request **`payload` is ignored when reusing** an existing row. If the Firebase token includes **`email`**,
+        the server best-effort persists or backfills it on the end-user row (including on reuse).
+      security:
+        - firebaseBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionRequest'
+      responses:
+        "200":
+          description: Session token for an existing or newly created session.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessionToken]
+                properties:
+                  sessionToken:
+                    type: string
+        "401":
+          description: Missing or invalid Firebase Authorization header.
+        "429":
+          $ref: '#/components/responses/BillingLimitExceeded'
+
+  /api/v1/sessions/renew/{sessionToken}:
+    post:
+      tags: [ai-optional]
+      summary: Renew session JWT (replace expired token)
+      description: |
+        Verifies **Firebase** ID token. Parses **`sessionToken`** path segment as an internal SESSION JWT
+        **without enforcing JWT expiry** (signature and `tokenType=SESSION` are still validated). The
+        Firebase UID must own the session. Returns a new **`sessionToken`** (incremented
+        **`tokenRevision`**) and the current decrypted **payload**.
+
+        If the Firebase token includes **`email`**, the server best-effort backfills it on the session owner.
+
+        **URL-encode** the JWT in the path (e.g. `encodeURIComponent` in JavaScript).
+      security:
+        - firebaseBearerAuth: []
+      parameters:
+        - name: sessionToken
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Previous SESSION JWT (may be expired)
+      responses:
+        "200":
+          description: New session token and payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionRenewResponse'
+        "401":
+          description: Missing or invalid Firebase or session token.
+        "403":
+          description: Firebase user does not own this session.
+        "404":
+          description: Session not found.
+        "410":
+          description: Session revoked.
+
+  /api/v1/sessions/set/{key}:
+    post:
+      tags: [ai-safe]
+      summary: Set a value inside the session payload
+      security:
+        - sessionBearerAuth: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetSessionValueRequest'
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionPayload'
+        "429":
+          $ref: '#/components/responses/BillingLimitExceeded'
+
+  /api/v1/sessions/get/{key}:
+    get:
+      tags: [ai-safe]
+      summary: Get a single value from the session payload
+      security:
+        - sessionBearerAuth: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetSessionValueResponse'
+
+  /api/v1/sessions/delete/{key}:
+    delete:
+      tags: [ai-safe]
+      summary: Delete a key from the session payload
+      security:
+        - sessionBearerAuth: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: boolean
+
+  /api/v1/sessions/my:
+    get:
+      tags: [ai-optional]
+      summary: List my sessions (paged, sortable, filterable)
+      description: |
+        Returns a page of sessions for the current user within the current workspace.
+        Self-service dashboard endpoint — requires workspace **`enableSelfService: true`**.
+        Payload is included only for rows whose computed status is active.
+        Sort keys match the admin workspace session list; `pageSize` is clamped to 1–200 (default 20).
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: pageSize
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 20
+          description: Page size (server clamps to 1–200; 0 or invalid uses default 20).
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Search by session id, app id, or user identifier (own uid)
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [all, active, expired, revoked]
+            default: all
+          description: Computed session lifecycle filter (`all` or same values as admin session list).
+        - name: app_id
+          in: query
+          required: false
+          schema:
+            type: string
+            default: all
+          description: Filter by client app id, or `all`.
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [id, user, app, created, expires, status, lastActivity, updated]
+            default: created
+        - name: dir
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+      responses:
+        "200":
+          description: Paged sessions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionUserPageResponse'
+        "401":
+          description: Missing or invalid internal USER token.
+        "403":
+          description: Self-service is disabled for this workspace.
+          content:
+            application/json:
+              example:
+                error: Self-service is disabled for this workspace
+
+  /api/v1/sessions/revoke/{sessionId}:
+    post:
+      tags: [ai-optional]
+      summary: Revoke a session owned by the current user
+      description: |
+        Self-service dashboard endpoint. Revokes a session owned by the caller in the current workspace.
+        Requires workspace **`enableSelfService: true`**.
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked, sessionId]
+                properties:
+                  revoked:
+                    type: boolean
+                  sessionId:
+                    type: integer
+        "401":
+          description: Missing or invalid internal USER token.
+        "403":
+          description: Self-service is disabled for this workspace.
+          content:
+            application/json:
+              example:
+                error: Self-service is disabled for this workspace
+        "404":
+          description: Session not found (or not owned by user).
+
+  /api/v1/sessions/revoke:
+    post:
+      tags: [ai-safe]
+      summary: Revoke the current session (by session token)
+      description: |
+        Revokes the session referenced by the internal SESSION Bearer token. Useful for automation
+        clients that only hold a session token and want to revoke it cleanly.
+      security:
+        - sessionBearerAuth: []
+      responses:
+        "200":
+          description: Session revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked, sessionId]
+                properties:
+                  revoked:
+                    type: boolean
+                  sessionId:
+                    type: integer
+        "401":
+          description: Missing or invalid internal SESSION token.
+        "404":
+          description: Session not found.
+        "410":
+          description: Session revoked or token superseded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 410
+                error: Session revoked
+
+  /api/v1/sessions/export:
+    get:
+      tags: [human-only]
+      summary: Export active workspace sessions (decrypted payload)
+      description: |
+        Admin/owner data export. Same paging, search, app filter, and sort as `GET /sessions/admin`, but:
+
+        - Only **active** sessions are included (no `status` query parameter).
+        - Each row contains **app id**, **user email**, and **decrypted session payload** (flat key/value map) only.
+        - Page size uses server config `sessions.export.page-size` (default **100**, max **200**).
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Search by session id, user identifier, or app id
+        - name: app_id
+          in: query
+          required: false
+          schema:
+            type: string
+            default: all
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [id, user, app, created, expires, status, lastActivity, updated]
+            default: created
+        - name: dir
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+      responses:
+        "200":
+          description: Paged export rows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionExportPageResponse'
+              example:
+                items:
+                  - appId: acme-web
+                    userEmail: user@example.com
+                    payload:
+                      note: hello
+                page: 0
+                pageSize: 100
+                totalItems: 1
+                totalPages: 1
+        "401":
+          description: Missing or invalid internal USER token.
+        "403":
+          description: Requires ADMIN or OWNER role.
+
+  /api/v1/sessions/admin:
+    get:
+      tags: [human-only]
+      summary: List workspace sessions (cross-user, paged)
+      description: |
+        Admin/owner workspace view. Metadata only — no payload content.
+        Page size is fixed by server config `sessions.admin.page-size` (default **10**, max **200**).
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Search by id, user identifier, or app id
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [all, active, expired, revoked]
+        - name: app_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [id, user, app, created, expires, status, lastActivity, updated]
+        - name: dir
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+      responses:
+        "200":
+          description: Paged sessions list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionWorkspacePageResponse'
+        "401":
+          description: Missing or invalid internal USER token.
+        "403":
+          description: Requires ADMIN or OWNER role.
+
+  /api/v1/sessions/admin/{sessionId}:
+    get:
+      tags: [human-only]
+      summary: Get workspace session detail (includes decrypted payload for OWNER/ADMIN when present)
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Session detail
+          content:
+            application/json:
+              schema:
+                type: object
+        "403":
+          description: Requires ADMIN or OWNER role.
+        "404":
+          description: Not found in workspace.
+
+  /api/v1/sessions/admin/revoke/{sessionId}:
+    post:
+      tags: [human-only]
+      summary: Revoke any workspace session (admin/owner only)
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked, sessionId]
+                properties:
+                  revoked:
+                    type: boolean
+                  sessionId:
+                    type: integer
+        "403":
+          description: Requires ADMIN or OWNER role.
+
+  /api/v1/sessions/admin/{sessionId}/ttl:
+    post:
+      tags: [human-only]
+      summary: Update session payload TTL (admin/owner)
+      description: |
+        Sets payload expiration for an **active** session in the current workspace.
+        **`ttlSeconds=0`** means unlimited (no expiration). Allowed range is **`0`** or **`60–315360000`**
+        (10 years cap).
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionTtlUpdateRequest'
+            example:
+              ttlSeconds: 3600
+      responses:
+        "200":
+          description: TTL updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [updated, sessionId]
+                properties:
+                  updated:
+                    type: boolean
+                  sessionId:
+                    type: integer
+        "400":
+          description: Invalid ttlSeconds or session not active.
+        "403":
+          description: Requires ADMIN or OWNER role.
+        "404":
+          description: Session not found in workspace.
+
+  /api/v1/sessions/admin/analytics/concurrent-sessions:
+    get:
+      tags: [human-only]
+      summary: Concurrent sessions per day (analytics)
+      description: |
+        Returns one sample per day in the inclusive **[start, end]** range (max **61** days).
+        Defaults to the current calendar month when dates are omitted. Metadata only — no payload content.
+      security:
+        - userBearerAuth: []
+      parameters:
+        - name: start
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+          description: Inclusive start date (ISO-8601). Default is first day of current month.
+        - name: end
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+          description: Inclusive end date (ISO-8601). Default is last day of current month.
+      responses:
+        "200":
+          description: Daily concurrent session counts.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ConcurrentSessionsSample'
+              example:
+                - date: "2026-06-01"
+                  count: 12
+                - date: "2026-06-02"
+                  count: 15
+        "400":
+          description: Date range too large (max 61 days).
+        "403":
+          description: Requires ADMIN or OWNER role.
+
+components:
+  securitySchemes:
+    firebaseBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        **Firebase ID token** from the client SDK (`Authorization: Bearer <token>`).
+        When the token includes `email`, session endpoints best-effort persist it on the workspace end-user row
+        (audit display only; no extra request fields).
+    userBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        **Internal USER JWT** issued by this API (`tokenType=USER`). Contains workspace and role claims.
+    sessionBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Internal session JWT from `POST /api/v1/sessions` or `POST /api/v1/sessions/get-or-create`
+        (`tokenType=SESSION`; subject = session id).
+
+  responses:
+    BillingLimitExceeded:
+      description: |
+        Workspace billing plan limit reached. HTTP status is always **429 Too Many Requests**.
+        Inspect **`code`** for `BILLING_SESSION_LIMIT` vs `BILLING_PAYLOAD_LIMIT`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BillingLimitError'
+          examples:
+            sessionLimit:
+              value:
+                status: 429
+                code: BILLING_SESSION_LIMIT
+                error: workspace concurrent session limit reached (max 20)
+            payloadLimit:
+              value:
+                status: 429
+                code: BILLING_PAYLOAD_LIMIT
+                error: session payload exceeds plan limit (max 2048 bytes)
+
+  schemas:
+    WorkspaceCreateResponse:
+      type: object
+      required: [workspace, accessToken]
+      properties:
+        workspace:
+          $ref: '#/components/schemas/Workspace'
+        accessToken:
+          type: string
+          description: Internal USER JWT — OWNER role for the new workspace
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+
+    UserLoginRequest:
+      type: object
+      required: [workspaceName]
+      properties:
+        workspaceName:
+          type: string
+          example: demo-workspace
+
+    UserLoginResponse:
+      type: object
+      required: [accessToken]
+      properties:
+        accessToken:
+          type: string
+          example: eyJhbGciOi...USER
+
+    UserWorkspaceMembershipView:
+      type: object
+      required: [workspaceId, workspaceName, role]
+      properties:
+        workspaceId:
+          type: integer
+          format: int64
+          example: 42
+        workspaceName:
+          type: string
+          example: demo-workspace
+        role:
+          type: string
+          description: Workspace role for this Firebase account (`OWNER`, `ADMIN`, `USER`, `ANONIMOUS`, etc.)
+          example: USER
+
+    UserWorkspaceMembershipListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserWorkspaceMembershipView'
+
+    UserFromInviteRequest:
+      type: object
+      required: [secretKey]
+      properties:
+        secretKey:
+          type: string
+          example: invite-secret-uuid
+
+    AnonymousUserRequest:
+      type: object
+      required: [workspaceName]
+      properties:
+        workspaceName:
+          type: string
+          example: demo-workspace
+
+    UserPageResponse:
+      type: object
+      required: [items, page, pageSize, totalItems, totalPages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserDto'
+        page:
+          type: integer
+          description: Zero-based page index
+        pageSize:
+          type: integer
+        totalItems:
+          type: integer
+          format: int64
+        totalPages:
+          type: integer
+
+    UserDto:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        workspaceId:
+          type: integer
+          example: 1
+        role:
+          type: string
+          example: OWNER
+        providerUid:
+          type: string
+          example: p2G3qPWP8sZYST3cCORPUZCbXN72
+        userName:
+          type: string
+          nullable: true
+          example: bob
+        email:
+          type: string
+          nullable: true
+          description: |
+            Best-effort from Firebase (login, session flows, or `GET /users` / `GET /users/{id}` Admin lookup).
+            Display only; not used for authentication.
+          example: user@example.com
+        status:
+          type: string
+          example: active
+        authProvider:
+          type: string
+          example: FIREBASE
+
+    Workspace:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        name:
+          type: string
+          example: demo-workspace
+        acceptAnonimous:
+          type: boolean
+          example: true
+        enableSelfService:
+          type: boolean
+          example: true
+          description: Whether end users may use the self-service dashboard for this workspace
+
+    WorkspaceCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: Unique workspace name (public tenant identifier)
+          example: demo-workspace
+        acceptAnonimous:
+          type: boolean
+          default: true
+          description: Whether anonymous Firebase users may create sessions in this workspace
+        enableSelfService:
+          type: boolean
+          default: true
+          description: Whether end users may use the self-service dashboard for this workspace
+        planName:
+          type: string
+          enum: [free, base, pro]
+          description: Initial billing catalog plan. Defaults to **free** when omitted.
+          example: free
+
+    WorkspaceBillingUsage:
+      type: object
+      required: [activeSessionCount]
+      properties:
+        activeSessionCount:
+          type: integer
+          format: int64
+          description: Active sessions in the workspace (same definition as billing enforcement)
+        largestActivePayloadBytes:
+          type: integer
+          format: int64
+          nullable: true
+          description: Max `currentDataSizeBytes` among active sessions, or null when none
+
+    BillingDowngradeBlockedDetail:
+      type: object
+      required:
+        - targetPlan
+        - activeSessionCount
+        - maxConcurrentSessionsAllowed
+        - sessionsOverLimit
+        - maxPayloadBytesAllowed
+        - payloadOverLimit
+      properties:
+        targetPlan:
+          type: string
+        activeSessionCount:
+          type: integer
+          format: int64
+        maxConcurrentSessionsAllowed:
+          type: integer
+        sessionsOverLimit:
+          type: boolean
+        largestActivePayloadBytes:
+          type: integer
+          format: int64
+          nullable: true
+        maxPayloadBytesAllowed:
+          type: integer
+        payloadOverLimit:
+          type: boolean
+
+    BillingDowngradeBlockedError:
+      allOf:
+        - $ref: '#/components/schemas/ApiError'
+      required: [status, code, error, details]
+      properties:
+        details:
+          $ref: '#/components/schemas/BillingDowngradeBlockedDetail'
+
+    WorkspaceBillingUpdateRequest:
+      type: object
+      properties:
+        planName:
+          type: string
+          enum: [free, base, pro]
+          description: Target catalog plan (OWNER / ADMIN / SUPPORT; Beta only)
+        overrideMaxConcurrentSessions:
+          type: integer
+          nullable: true
+          description: SUPPORT only; null clears override
+        overrideMaxPayloadBytes:
+          type: integer
+          nullable: true
+          description: SUPPORT only; null clears override
+
+    WorkspaceBillingResponse:
+      type: object
+      required:
+        - planName
+        - effectiveMaxConcurrentSessions
+        - effectiveMaxPayloadBytes
+        - billingStatus
+        - usage
+        - checkoutAvailable
+        - cancelAvailable
+        - overFreeTierLimits
+      properties:
+        planName:
+          type: string
+          enum: [free, base, pro]
+          description: Assigned catalog plan
+        effectiveMaxConcurrentSessions:
+          type: integer
+          description: Enforced concurrent active session cap (override or plan default)
+        effectiveMaxPayloadBytes:
+          type: integer
+          description: Enforced decrypted payload UTF-8 byte cap (override or plan default)
+        overrideMaxConcurrentSessions:
+          type: integer
+          nullable: true
+          description: SUPPORT-only override when set; null when using plan default
+        overrideMaxPayloadBytes:
+          type: integer
+          nullable: true
+          description: SUPPORT-only override when set; null when using plan default
+        billingStatus:
+          type: string
+          description: |
+            Lifecycle status. Common values: `beta`, `active`, `trialing`, `past_due`,
+            `canceling` (renewal stopped; paid until `paidPeriodEndsAt`),
+            `grace_lock` (period ended without Free; end-user session I/O blocked until Free
+            downgrade or grace wipe), `canceled`.
+          example: beta
+        usage:
+          $ref: '#/components/schemas/WorkspaceBillingUsage'
+        checkoutAvailable:
+          type: boolean
+          description: |
+            True when payment integration is enabled and the active provider is configured
+            (staging). False on production Beta — console uses PATCH for plan changes.
+        paymentProvider:
+          type: string
+          nullable: true
+          description: Active provider id (e.g. `paddle`) when checkoutAvailable; otherwise null
+        paddleClientToken:
+          type: string
+          nullable: true
+          description: Paddle.js client token when checkoutAvailable
+        paddleEnvironment:
+          type: string
+          nullable: true
+          description: "`sandbox` or `production` for Paddle.js when checkoutAvailable"
+        cancelAvailable:
+          type: boolean
+          description: |
+            True when checkout is available and the workspace can cancel a paid subscription
+            (or is already `canceling`). False on Free/Beta, `grace_lock`, and when payment is disabled.
+        paidPeriodEndsAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: End of already-paid entitlement after cancel (ISO-8601); null when not canceling
+        cancelRequestedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: When cancel was requested; null when not canceling
+        overFreeTierLimits:
+          type: boolean
+          description: |
+            True when current usage exceeds Free-tier concurrent session and/or payload caps
+            (useful for cancel confirmation copy).
+        resumeAvailable:
+          type: boolean
+          description: |
+            True when checkout is available and the workspace is `canceling` (undo cancel /
+            resume auto-renewal via POST …/resume). False in `grace_lock`.
+        graceEndsAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            When `billingStatus` is `grace_lock`, countdown to automatic wipe of all active
+            session payloads (ISO-8601). Null outside grace lock, including after wipe → Free.
+
+    BillingCheckoutRequest:
+      type: object
+      required: [planName, successUrl, cancelUrl]
+      properties:
+        planName:
+          type: string
+          enum: [base, pro]
+          description: Paid catalog plan to purchase
+        successUrl:
+          type: string
+          format: uri
+          description: App URL after successful checkout (UI refresh hint; webhooks are source of truth)
+        cancelUrl:
+          type: string
+          format: uri
+          description: App URL if the customer abandons checkout
+
+    BillingCheckoutResponse:
+      type: object
+      required: [checkoutUrl, provider, externalSessionId]
+      properties:
+        checkoutUrl:
+          type: string
+          format: uri
+        provider:
+          type: string
+          example: paddle
+        externalSessionId:
+          type: string
+          description: Provider transaction / session id
+        paddleClientToken:
+          type: string
+          nullable: true
+        paddleEnvironment:
+          type: string
+          nullable: true
+
+    WorkspaceUpdateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          nullable: true
+          example: demo-workspace-renamed
+        acceptAnonimous:
+          type: boolean
+          nullable: true
+          example: false
+        enableSelfService:
+          type: boolean
+          nullable: true
+          description: When false, end users cannot list or log into this workspace via self-service
+
+    InviteCreateRequest:
+      type: object
+      required: [role, ttlSeconds]
+      properties:
+        role:
+          type: string
+          enum: [admin, user]
+          description: Invite role for the user who redeems the secret (`admin` or `user`)
+          example: admin
+        ttlSeconds:
+          type: integer
+          format: int64
+          description: Time-to-live **in seconds** from invite creation
+          example: 3600
+
+    InviteCreateResponse:
+      type: object
+      required: [secretKey, expiresAt]
+      properties:
+        secretKey:
+          type: string
+          example: invite-secret-123
+        expiresAt:
+          type: string
+          format: date-time
+          example: "2026-03-26T12:34:56Z"
+
+    InviteResponse:
+      type: object
+      required: [id, role, expiresAt, status, createdAt]
+      properties:
+        id:
+          type: integer
+          example: 10
+        role:
+          type: string
+          example: admin
+        expiresAt:
+          type: string
+          format: date-time
+          example: "2026-03-26T12:34:56Z"
+        status:
+          type: string
+          example: active
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-03-26T11:34:56Z"
+
+    InvitePageResponse:
+      type: object
+      required: [items, page, pageSize, totalItems, totalPages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/InviteResponse'
+        page:
+          type: integer
+          description: Zero-based page index
+        pageSize:
+          type: integer
+        totalItems:
+          type: integer
+          format: int64
+        totalPages:
+          type: integer
+
+    InviteDetailResponse:
+      type: object
+      required: [id, secretKey, role, expiresAt, status, createdAt]
+      properties:
+        id:
+          type: integer
+          example: 10
+        secretKey:
+          type: string
+          example: invite-secret-123
+        role:
+          type: string
+          example: admin
+        expiresAt:
+          type: string
+          format: date-time
+          example: "2026-03-26T12:34:56Z"
+        status:
+          type: string
+          example: active
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-03-26T11:34:56Z"
+
+    ClientAppRequest:
+      type: object
+      description: Create application (all fields required except TTL overrides)
+      required: [appId, displayName, redirectUris]
+      properties:
+        appId:
+          type: string
+          description: Stable id — use as `app_id` on hosted login
+          example: acme-web
+        displayName:
+          type: string
+          example: Acme Web App
+        redirectUris:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: uri
+        sessionTokenTtlSeconds:
+          type: integer
+          format: int64
+          nullable: true
+          description: Optional per-app session JWT lifetime override (seconds)
+        sessionPayloadTtlSeconds:
+          type: integer
+          format: int64
+          nullable: true
+          description: Optional per-app payload TTL override (seconds; 0 = unlimited)
+
+    ClientAppPatchBody:
+      type: object
+      description: Partial update; omit fields you do not change
+      properties:
+        displayName:
+          type: string
+          nullable: true
+        redirectUris:
+          type: array
+          nullable: true
+          items:
+            type: string
+            format: uri
+        sessionTokenTtlSeconds:
+          type: integer
+          format: int64
+          nullable: true
+        sessionPayloadTtlSeconds:
+          type: integer
+          format: int64
+          nullable: true
+
+    AppendRedirectUriRequest:
+      type: object
+      required: [redirectUri]
+      properties:
+        redirectUri:
+          type: string
+          format: uri
+          example: https://acme.example/callback
+
+    ClientAppResponse:
+      type: object
+      required: [id, workspaceId, appId, displayName, redirectUris]
+      properties:
+        id:
+          type: integer
+          format: int64
+        workspaceId:
+          type: integer
+          format: int64
+        appId:
+          type: string
+        displayName:
+          type: string
+        redirectUris:
+          type: array
+          items:
+            type: string
+            format: uri
+        sessionTokenTtlSeconds:
+          type: integer
+          format: int64
+          nullable: true
+        sessionPayloadTtlSeconds:
+          type: integer
+          format: int64
+          nullable: true
+
+    ClientAppPageResponse:
+      type: object
+      required: [items, page, pageSize, totalItems, totalPages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClientAppResponse'
+        page:
+          type: integer
+          description: Zero-based page index
+        pageSize:
+          type: integer
+        totalItems:
+          type: integer
+          format: int64
+        totalPages:
+          type: integer
+
+    ApiError:
+      type: object
+      required: [status, error]
+      properties:
+        status:
+          type: integer
+          description: HTTP status code
+        error:
+          type: string
+          description: Human-readable error message
+        code:
+          type: string
+          description: Stable machine-readable error code (billing errors only)
+          enum: [BILLING_SESSION_LIMIT, BILLING_PAYLOAD_LIMIT, BILLING_DOWNGRADE_BLOCKED, BILLING_GRACE_LOCK]
+
+    BillingLimitError:
+      allOf:
+        - $ref: '#/components/schemas/ApiError'
+      required: [status, code, error]
+
+    SessionTtlUpdateRequest:
+      type: object
+      required: [ttlSeconds]
+      properties:
+        ttlSeconds:
+          type: integer
+          format: int64
+          description: New payload TTL from now in seconds; 0 = unlimited
+
+    ConcurrentSessionsSample:
+      type: object
+      required: [date, count]
+      properties:
+        date:
+          type: string
+          format: date
+        count:
+          type: integer
+          description: Concurrent active sessions on that day
+
+    RedirectValidationRequest:
+      type: object
+      required: [appId, redirectUri]
+      properties:
+        appId:
+          type: string
+          description: Same as `app_id` query parameter on hosted login
+        redirectUri:
+          type: string
+          format: uri
+
+    RedirectValidationResponse:
+      type: object
+      required: [valid]
+      properties:
+        valid:
+          type: boolean
+        appId:
+          type: string
+          nullable: true
+        redirectUri:
+          type: string
+          nullable: true
+        reason:
+          type: string
+          nullable: true
+          description: Human-readable; `"ok"` when valid
+        displayName:
+          type: string
+          nullable: true
+          description: >-
+            Client application display name; only set when `valid` is `true`. Shown by hosted
+            login on the account-confirmation prompt ("Continue as …?").
+
+    WorkspaceAuditEventPageResponse:
+      type: object
+      required: [items, page, pageSize, totalItems, totalPages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkspaceAuditEventView'
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        totalItems:
+          type: integer
+          format: int64
+        totalPages:
+          type: integer
+
+    WorkspaceAuditEventView:
+      type: object
+      required: [id, eventType, occurredAt]
+      properties:
+        id:
+          type: integer
+          format: int64
+        eventType:
+          type: string
+          description: |
+            High-level category, e.g. `SESSION_CREATED`, `USER_CREATED`, `USER_LOGIN`, `SESSION_KEY_WRITTEN`,
+            `BILLING_PLAN_CHANGED`, `BILLING_OVERRIDE_UPDATED`, `BILLING_SESSION_LIMIT_EXCEEDED`,
+            `BILLING_PAYLOAD_LIMIT_EXCEEDED`, `BILLING_CANCEL_REQUESTED`, `BILLING_RESUME_REQUESTED`,
+            `BILLING_GRACE_LOCK_ENTERED`, `BILLING_GRACE_WIPE`.
+          example: SESSION_CREATED
+        occurredAt:
+          type: string
+          format: date-time
+        sessionRowId:
+          type: integer
+          format: int64
+          nullable: true
+          description: Internal session id when the event is session-scoped
+        sessionUserIdentifier:
+          type: string
+          nullable: true
+          description: Firebase UID for the session subject user (fallback when email is absent)
+        sessionUserEmail:
+          type: string
+          nullable: true
+          description: |
+            Email from the workspace user row when set (best-effort from Firebase on login/session flows).
+            Audit UIs should prefer this over `sessionUserIdentifier`.
+        sessionAppId:
+          type: string
+          nullable: true
+        sessionStatus:
+          type: string
+          nullable: true
+          description: active, expired, or revoked when session row exists
+        actorProviderUid:
+          type: string
+          nullable: true
+        actorDisplayName:
+          type: string
+          nullable: true
+        actorEmail:
+          type: string
+          nullable: true
+          description: Actor email when known; prefer over `actorProviderUid` in UIs
+        metadataJson:
+          type: string
+          nullable: true
+          description: |
+            Event-specific JSON metadata (no session payload). For billing limit events, includes
+            `code` (`BILLING_SESSION_LIMIT` or `BILLING_PAYLOAD_LIMIT`), `planLimit`, `observedValue`,
+            and optional `appId`.
+          example: '{"code":"BILLING_SESSION_LIMIT","planLimit":20,"observedValue":20,"appId":"acme-web"}'
+
+    ApiAccessLogPageResponse:
+      type: object
+      required: [items, page, pageSize, totalItems, totalPages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiAccessLogView'
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        totalItems:
+          type: integer
+          format: int64
+        totalPages:
+          type: integer
+
+    ApiAccessLogView:
+      type: object
+      required: [id, occurredAt, httpMethod, endpoint, httpStatus, durationMs]
+      properties:
+        id:
+          type: integer
+          format: int64
+        occurredAt:
+          type: string
+          format: date-time
+        httpMethod:
+          type: string
+          example: POST
+        endpoint:
+          type: string
+          example: /sessions/set/hello
+        httpStatus:
+          type: integer
+          example: 200
+        durationMs:
+          type: integer
+          format: int64
+          example: 18
+        sessionId:
+          type: integer
+          format: int64
+          nullable: true
+        tokenRevision:
+          type: integer
+          nullable: true
+        userFirebaseId:
+          type: string
+          nullable: true
+          description: Firebase UID when email is unavailable
+        userEmail:
+          type: string
+          nullable: true
+          description: Prefer for display; enriched from user row or session owner
+        applicationId:
+          type: string
+          nullable: true
+          description: Client app id when known
+        clientIp:
+          type: string
+          nullable: true
+        userAgent:
+          type: string
+          nullable: true
+
+    SessionRequest:
+      type: object
+      required: [workspaceName]
+      properties:
+        workspaceName:
+          type: string
+          description: Workspace name to scope the session
+          example: demo-workspace
+        app_id:
+          type: string
+          nullable: true
+          description: Optional app id (must belong to the workspace). Used for per-app session policy and auditing.
+          example: acme-web
+        payload:
+          type: object
+          additionalProperties: true
+          default: {}
+          description: Arbitrary payload object stored in the session. Optional; omitted or null is stored as `{}`.
+
+    SessionRenewResponse:
+      type: object
+      required: [sessionToken, payload]
+      properties:
+        sessionToken:
+          type: string
+          description: New internal JWT (`tokenType=SESSION`)
+        payload:
+          $ref: '#/components/schemas/SessionPayload'
+
+    SessionUserPageResponse:
+      type: object
+      required: [items, page, pageSize, totalItems, totalPages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SessionUserView'
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        totalItems:
+          type: integer
+          format: int64
+        totalPages:
+          type: integer
+
+    SessionUserView:
+      type: object
+      description: Session payload + metadata view for the current user dashboard.
+      required: [id, workspaceId, providerUid, status, payload]
+      properties:
+        id:
+          type: integer
+          format: int64
+        workspaceId:
+          type: integer
+          format: int64
+        providerUid:
+          type: string
+        userEmail:
+          type: string
+          nullable: true
+          description: Email from the workspace user row when known
+        appId:
+          type: string
+          nullable: true
+          description: Client application id when the session is bound to an app
+        status:
+          type: string
+          example: active
+        securityLevel:
+          type: string
+          nullable: true
+          description: Best-effort classification from backend (may be null)
+        tokenRevision:
+          type: integer
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastActivityAt:
+          type: string
+          format: date-time
+          nullable: true
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+        endedAt:
+          type: string
+          format: date-time
+          nullable: true
+        revokedBy:
+          type: string
+          nullable: true
+        revokedByDisplayName:
+          type: string
+          nullable: true
+        currentDataSizeBytes:
+          type: integer
+          format: int64
+          nullable: true
+        maxDataSizeBytes:
+          type: integer
+          format: int64
+          nullable: true
+        payload:
+          $ref: '#/components/schemas/SessionPayload'
+
+    SessionPayload:
+      type: object
+      description: Decrypted session payload wrapper (`properties` holds key/value data).
+      properties:
+        properties:
+          type: object
+          additionalProperties: true
+          description: Decrypted key/value map
+
+    SessionIdentityView:
+      type: object
+      required: [userId, email]
+      properties:
+        userId:
+          type: integer
+          format: int64
+          nullable: true
+          description: >-
+            Stable, opaque id for this person across sessions/logins. Not a Firebase UID. Intended
+            correlation key for your own backend linking external events (e.g. billing webhooks) to
+            this user.
+          example: 42
+        email:
+          type: string
+          nullable: true
+          description: Workspace end-user email when known (from hosted login); null otherwise.
+          example: user@example.com
+
+    SessionExportItem:
+      type: object
+      required: [payload]
+      properties:
+        appId:
+          type: string
+          nullable: true
+          description: Client application id when bound to an app
+        userEmail:
+          type: string
+          nullable: true
+          description: Login email when present
+        payload:
+          type: object
+          additionalProperties: true
+          description: Decrypted session key/value data (flat map, no `properties` wrapper)
+
+    SessionExportPageResponse:
+      type: object
+      required: [items, page, pageSize, totalItems, totalPages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SessionExportItem'
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        totalItems:
+          type: integer
+          format: int64
+        totalPages:
+          type: integer
+
+    SessionWorkspacePageResponse:
+      type: object
+      required: [items, page, pageSize, totalItems, totalPages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SessionWorkspaceListItem'
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        totalItems:
+          type: integer
+          format: int64
+        totalPages:
+          type: integer
+
+    SessionWorkspaceListItem:
+      type: object
+      description: Workspace session row (admin list; no payload).
+      properties:
+        id:
+          type: integer
+          format: int64
+        userIdentifier:
+          type: string
+          nullable: true
+          description: Firebase / provider UID
+        userEmail:
+          type: string
+          nullable: true
+        revokedBy:
+          type: string
+          nullable: true
+        appId:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+        status:
+          type: string
+        currentDataSizeBytes:
+          type: integer
+          format: int64
+          nullable: true
+        maxDataSizeBytes:
+          type: integer
+          format: int64
+          nullable: true
+        lastActivityAt:
+          type: string
+          format: date-time
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        attributeCount:
+          type: integer
+          description: Decrypted payload property count; 0 when payload is absent or wiped
+
+    SetSessionValueRequest:
+      description: >
+        JSON body can be either `{ "value": <x> }` (preferred) or a raw JSON value.
+      oneOf:
+        - type: object
+          required: [value]
+          additionalProperties: false
+          properties:
+            value: {}
+        - type: string
+        - type: number
+        - type: integer
+        - type: boolean
+        - type: array
+        - type: object
+          additionalProperties: true
+        - type: 'null'
+
+    GetSessionValueResponse:
+      type: object
+      required: [key, value]
+      properties:
+        key:
+          type: string
+        value:
+          description: Stored payload value for the requested key
+
