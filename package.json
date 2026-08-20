@@ -36,7 +36,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/server.ts",
     "start": "node dist/src/server.js",
-    "test": "node --import tsx --test test/**/*.test.ts",
+    "test": "node --import tsx --test test/http-smoke.test.ts test/invoke-tool.test.ts test/json-schema.test.ts test/resilience.test.ts test/select-operations.test.ts test/static-tools.test.ts",
     "prepack": "npm run build && node scripts/bundle-openapi.mjs"
   },
   "dependencies": {
