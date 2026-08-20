@@ -1,6 +1,6 @@
 # secureFlows MCP Server
 
-[![secureFlows](https://img.shields.io/badge/secureFlows-www.secure--flows.com-1a73e8)](https://www.secure-flows.com)
+[![secureFlows](https://img.shields.io/badge/secureFlows-www.secure--flows.com-1a73e8)](https://www.secure-flows.com) [![CI](https://github.com/michal-lefler/secureflows-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/michal-lefler/secureflows-mcp-server/actions/workflows/ci.yml)
 
 Cloud-deployable MCP server that wraps the [secureFlows](https://www.secure-flows.com) OpenAPI
 surface tagged `ai-safe` and `ai-optional`.
