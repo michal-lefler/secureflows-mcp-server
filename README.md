@@ -1,10 +1,13 @@
 # secureFlows MCP Server
 
-Cloud-deployable MCP server that wraps the secureFlows OpenAPI surface tagged `ai-safe` and `ai-optional`.
+[![secureFlows](https://img.shields.io/badge/secureFlows-www.secure--flows.com-1a73e8)](https://www.secure-flows.com)
 
 > This repo is a public mirror, published periodically from the private secureFlows monorepo
 > where development actually happens. Issues and PRs are welcome; large changes may take a
 > release cycle to land upstream first.
+
+Cloud-deployable MCP server that wraps the [secureFlows](https://www.secure-flows.com) OpenAPI
+surface tagged `ai-safe` and `ai-optional`.
 
 ## What is an MCP server?
 
