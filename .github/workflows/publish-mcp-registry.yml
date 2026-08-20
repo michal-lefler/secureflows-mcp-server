@@ -1,0 +1,44 @@
+# Mirror-only workflow: lives in scripts/public-mirrors/overlays/secureflows-mcp-server/ in the
+# private secureFlows monorepo. Edit it there; scripts/sync-public-mirrors.mjs copies it into
+# this repo on every sync.
+#
+# Publishes server.json to the official MCP Registry (registry.modelcontextprotocol.io) whenever
+# it changes on main. Uses GitHub OIDC — no stored secret, no PAT to rotate; the registry trusts
+# this workflow run because it's running inside the exact repo the server.json namespace
+# (io.github.michal-lefler/secureflows-mcp-server) claims to belong to.
+#
+# This repo's server.json only ever declares a `remotes` entry (the hosted
+# https://www.secure-flows.com/mcp endpoint) — the npm package itself is published separately by
+# the private monorepo's own CI, so there's no npm-publish step here.
+name: Publish to MCP Registry
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - server.json
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required for OIDC authentication
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Validate server.json
+        run: ./mcp-publisher validate
+
+      - name: Publish server to MCP Registry
+        run: ./mcp-publisher publish
